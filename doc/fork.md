@@ -103,14 +103,22 @@ app/src/daemon/broadcaster.{c,h}  protocol-v4 encoded-video push sink; emits
 app/src/daemon/clip_buffer.{c,h}  encoded-stream spool sink; "clip" op extracts
                                   a [start,end] segment as codec-compatible MP4
                                   or VP8 WebM while recording continues;
+                                  uses the first retained decoded frame's media
+                                  PTS as its explicit zero,
                                   preserves stream-session epochs, crosses
                                   exactly compatible refreshes and rejects
                                   incompatible codec/config/geometry ranges
                                   without truncating time
 app/src/daemon/report.{c,h}       test-report recorder + event logger; manifest
                                   owns dynamic video filename/codec/container/
-                                  MIME metadata and an exact encoded-packet
-                                  timeline/tail
+                                  MIME metadata; events use host elapsed time
+                                  from the first retained decoded frame while
+                                  recorder/clip media use that frame's PTS;
+                                  recorder stop is deferred until the event
+                                  gate closes and the keeper clock freezes
+app/src/daemon/plugin_event.{c,h} canonical one-event plugin report schema:
+                                  complete inputs/assets, start/end/duration,
+                                  result/status/exit/service/adoption metadata
 app/src/daemon/addon.{c,h}        plugin add-ons (doc/addons.md); the Unified
                                   Plugin Protocol (metadata incl. service=true
                                   long-running add-ons, adaptive path/upload
@@ -154,7 +162,7 @@ app/data/bash-completion/scrcpy-auto, app/data/zsh-completion/_scrcpy-auto
 | `app/src/main.c` | daemon/client routing between `sc_log_configure()` and `sc_main_thread_init()`; the client branch dispatches `opts->mirror` → `sc_mirror_run()` (wrapped in `sc_main_thread_init/destroy`) vs `sc_client_run()` |
 | `app/src/util/net.{c,h}` | additive `net_local_port()` (getsockname helper) — used by mirror mode to find the ephemeral port of its loopback socket pairs |
 | `app/src/trait/packet_source.h` | `SC_PACKET_SOURCE_MAX_SINKS` 2 → **4** (decoder + broadcaster + clip buffer + recorder) |
-| `app/src/recorder.c` | internal WebM muxer mapping used by VP8 auto-test reports |
+| `app/src/recorder.c` | internal WebM muxer mapping used by VP8 auto-test reports; explicit first-retained-frame media origin drops preroll and requires the first recorded packet to hit that origin exactly as a keyframe |
 | `app/src/icon.h` | renamed icon filenames |
 | `app/src/sdl_hints.c` | SDL app name `scrcpy-auto` |
 | `app/scrcpy-windows.rc` | InternalName/OriginalFilename/ProductName |

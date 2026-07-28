@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #ifndef _WIN32
+# include <fcntl.h>
 # include <sys/wait.h>
 # include <time.h>
 #endif
@@ -31,6 +32,7 @@
 #include "daemon/codec.h"
 #include "daemon/clip_buffer.h"
 #include "daemon/frame_keeper.h"
+#include "daemon/plugin_event.h"
 #include "daemon/protocol.h"
 #include "daemon/registry.h"
 #include "daemon/report.h"
@@ -52,11 +54,11 @@
 #define SC_SERVICE_READY_TIMEOUT_MS 15000 // wait for a service to report ready
 #define SC_SERVICE_POLL_MS 25           // service readiness poll interval
 #define SC_SERVICE_TERM_GRACE_MS 2000   // SIGTERM grace before SIGKILL
+#define SC_SERVICE_KILL_WAIT_MS 2000    // bounded wait after forced termination
 // Files a single client connection may upload before they are cleaned up
 #define SC_DAEMON_MAX_UPLOADS 64
-// Cap on a plugin result file the daemon will read back (256 KiB)
-#define SC_DAEMON_MAX_RESULT_SIZE (256 * 1024)
 #define SC_DAEMON_SCREENCAP_DEADLINE SC_TICK_FROM_MS(2000)
+#define SC_DAEMON_FIRST_FRAME_DEADLINE SC_TICK_FROM_SEC(15)
 // Poll interval for stop-signal checks in supervisor waits
 #define SC_DAEMON_WAIT_TICK SC_TICK_FROM_MS(500)
 #define SC_DAEMON_BACKOFF_MIN_MS 1000
@@ -133,6 +135,7 @@ struct sc_daemon {
     atomic_bool report_recording;   // recorder running this session
 
     struct sc_addons addons; // loaded plugins (doc/addons.md)
+    unsigned plugin_asset_counter; // guarded by mutex
 
     // Adopted long-running "service" add-ons (doc/addons.md): started on demand,
     // kept running past their response, terminated on daemon shutdown. Guarded
@@ -301,6 +304,36 @@ sc_daemon_session_stop(struct sc_daemon *d) {
 }
 
 static bool
+sc_daemon_wait_first_report_frame(struct sc_daemon *d) {
+    sc_tick deadline = sc_tick_now() + SC_DAEMON_FIRST_FRAME_DEADLINE;
+    for (;;) {
+        sc_tick now = sc_tick_now();
+        if (now >= deadline) {
+            return false;
+        }
+        sc_tick slice = now + SC_DAEMON_WAIT_TICK;
+        if (slice > deadline) {
+            slice = deadline;
+        }
+
+        struct sc_size first_size;
+        if (sc_frame_keeper_wait_size(&d->keeper, slice, &first_size)) {
+            return true;
+        }
+
+        sc_mutex_lock(&d->mutex);
+        bool interrupted = d->stop || d->session.dead || g_stop_signal;
+        if (g_stop_signal) {
+            d->stop = true;
+        }
+        sc_mutex_unlock(&d->mutex);
+        if (interrupted) {
+            return false;
+        }
+    }
+}
+
+static bool
 sc_daemon_session_start(struct sc_daemon *d) {
     struct sc_daemon_session *s = &d->session;
     const struct scrcpy_options *options = d->opts;
@@ -451,6 +484,18 @@ sc_daemon_session_start(struct sc_daemon *d) {
             return false;
         }
         s->demuxer_started = true;
+
+        // A report timeline starts at the first successfully retained decoded
+        // frame. Do not expose READY (and therefore do not accept reportable
+        // operations) until that immutable anchor exists.
+        if (d->report_active) {
+            if (!sc_daemon_wait_first_report_frame(d)) {
+                LOGE("Test report: no decoded first frame within 15 seconds");
+                sc_report_mark_failed(&d->report);
+                sc_daemon_session_stop(d);
+                return false;
+            }
+        }
     }
 
     if (options->control) {
@@ -569,42 +614,55 @@ write_all_fd(int fd, const uint8_t *data, size_t len) {
     return true;
 }
 
-// Read a plugin result file (<= cap) and return its contents as a malloc'd
-// string only if it is valid JSON; otherwise NULL (warns on invalid).
-static char *
-read_result_file(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return NULL;
-    }
-    char *buf = malloc(SC_DAEMON_MAX_RESULT_SIZE + 1);
-    if (!buf) {
-        fclose(f);
-        return NULL;
-    }
-    size_t n = fread(buf, 1, SC_DAEMON_MAX_RESULT_SIZE, f);
-    fclose(f);
-    buf[n] = '\0';
-    if (n == 0) {
-        free(buf);
-        return NULL;
-    }
-    struct sc_json probe;
-    if (!sc_json_parse(&probe, buf, n)) {
-        LOGW("Add-on result file is not valid JSON; ignoring");
-        free(buf);
-        return NULL;
-    }
-    return buf;
+static bool
+plugin_copy_may_continue(struct sc_daemon *d) {
+    sc_mutex_lock(&d->mutex);
+    bool ready = d->state == SC_DAEMON_STATE_READY && !d->stop
+              && !d->session.dead;
+    sc_mutex_unlock(&d->mutex);
+    return ready;
 }
 
-// Copy a file (best-effort). Returns true on success.
+// Copy one bounded regular file, aborting between chunks if the leased device
+// session starts draining. This avoids blocking finalization on FIFOs, device
+// nodes, unbounded files, or a long copy that no longer belongs to the report.
 static bool
-copy_file(const char *src, const char *dst) {
+copy_plugin_file(struct sc_daemon *d, const char *src, const char *dst) {
+    if (!plugin_copy_may_continue(d)) {
+        return false;
+    }
+
+#ifndef _WIN32
+    // Open first, then validate that exact object. O_NONBLOCK prevents a
+    // stat->open FIFO substitution from stalling the session-drain path.
+    int fd = open(src, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd == -1) {
+        return false;
+    }
+    struct stat st;
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 0
+            || (uint64_t) st.st_size > SC_DAEMON_MAX_FRAME_SIZE) {
+        close(fd);
+        return false;
+    }
+    FILE *in = fdopen(fd, "rb");
+    if (!in) {
+        close(fd);
+        return false;
+    }
+#else
+    // Windows fopen() does not block on named pipes addressed as regular
+    // filesystem paths. Keep the portable regular-file validation here.
+    struct stat st;
+    if (stat(src, &st) || !S_ISREG(st.st_mode) || st.st_size < 0
+            || (uint64_t) st.st_size > SC_DAEMON_MAX_FRAME_SIZE) {
+        return false;
+    }
     FILE *in = fopen(src, "rb");
     if (!in) {
         return false;
     }
+#endif
     FILE *out = fopen(dst, "wb");
     if (!out) {
         fclose(in);
@@ -612,12 +670,19 @@ copy_file(const char *src, const char *dst) {
     }
     char buf[65536];
     size_t n;
+    size_t total = 0;
     bool ok = true;
     while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) {
+        if (n > SC_DAEMON_MAX_FRAME_SIZE - total
+                || !plugin_copy_may_continue(d)
+                || fwrite(buf, 1, n, out) != n) {
             ok = false;
             break;
         }
+        total += n;
+    }
+    if (ferror(in)) {
+        ok = false;
     }
     fclose(in);
     if (fclose(out) != 0) {
@@ -629,22 +694,62 @@ copy_file(const char *src, const char *dst) {
     return ok;
 }
 
-// Copy a plugin's path/pathlist argument files into <report>/assets/ (so the
-// report bundle is self-contained and can render reference images), appending
-// their relative paths to `eb` as ,"assets":[...]. Best-effort.
+struct sc_plugin_assets {
+    char **items;
+    size_t count;
+    size_t cap;
+};
+
 static void
-copy_plugin_assets(struct sc_daemon *d, const struct sc_addon *addon,
-                   char *const *arg_names, char *const *arg_values,
-                   unsigned count, struct sc_strbuf *eb) {
-    static unsigned counter = 0; // unique filenames (guarded by daemon mutex)
-    if (!d->opts->auto_test_report || !addon) {
-        return;
+plugin_assets_destroy(struct sc_plugin_assets *assets) {
+    for (size_t i = 0; i < assets->count; ++i) {
+        free(assets->items[i]);
     }
+    free(assets->items);
+    memset(assets, 0, sizeof(*assets));
+}
+
+static bool
+plugin_assets_append(struct sc_plugin_assets *assets, const char *path) {
+    if (assets->count == assets->cap) {
+        size_t cap = assets->cap ? assets->cap * 2 : 8;
+        if (cap > SIZE_MAX / sizeof(*assets->items)) {
+            return false;
+        }
+        char **items = realloc(assets->items, cap * sizeof(*items));
+        if (!items) {
+            return false;
+        }
+        assets->items = items;
+        assets->cap = cap;
+    }
+    char *copy = strdup(path);
+    if (!copy) {
+        return false;
+    }
+    assets->items[assets->count++] = copy;
+    return true;
+}
+
+// Copy every declared path/pathlist input into <report>/assets/ so the report
+// remains self-contained. The original values stay in inputs.named; this list
+// records the copied report-relative paths.
+static bool
+collect_plugin_assets(struct sc_daemon *d, const struct sc_addon *addon,
+                      char *const *arg_names, char *const *arg_values,
+                      unsigned count, struct sc_plugin_assets *assets) {
+    if (!d->opts->auto_test_report || !addon) {
+        return true;
+    }
+
     char dir[600];
     snprintf(dir, sizeof(dir), "%s/assets", d->opts->auto_test_report);
-    mkdir(dir, 0755); // ignore EEXIST
+    if (mkdir(dir, 0755) && errno != EEXIST) {
+        LOGW("Could not create plugin report asset directory: %s", dir);
+        return false;
+    }
 
-    bool started = false;
+    bool ok = true;
     for (unsigned i = 0; i < count; ++i) {
         bool is_path = false;
         for (unsigned j = 0; j < addon->arg_count; ++j) {
@@ -657,36 +762,53 @@ copy_plugin_assets(struct sc_daemon *d, const struct sc_addon *addon,
         if (!is_path) {
             continue;
         }
+
         char *dup = strdup(arg_values[i]);
         if (!dup) {
+            ok = false;
             continue;
         }
         char *saveptr = NULL;
         for (char *p = strtok_r(dup, "\n", &saveptr); p;
              p = strtok_r(NULL, "\n", &saveptr)) {
             const char *bn = strrchr(p, '/');
+#ifdef _WIN32
+            const char *win_bn = strrchr(p, '\\');
+            if (!bn || (win_bn && win_bn > bn)) {
+                bn = win_bn;
+            }
+#endif
             bn = bn ? bn + 1 : p;
+            if (!*bn) {
+                ok = false;
+                continue;
+            }
+
             sc_mutex_lock(&d->mutex);
-            unsigned idx = counter++;
+            unsigned idx = d->plugin_asset_counter++;
             sc_mutex_unlock(&d->mutex);
+
             char dst[1024];
             char rel[512];
-            snprintf(dst, sizeof(dst), "%s/%u-%s", dir, idx, bn);
-            snprintf(rel, sizeof(rel), "assets/%u-%s", idx, bn);
-            if (copy_file(p, dst)) {
-                bool w = started ? sc_strbuf_append_char(eb, ',')
-                                 : sc_strbuf_append_staticstr(eb, ",\"assets\":[");
-                started = true;
-                if (w) {
-                    sc_json_append_escaped(eb, rel);
-                }
+            int dst_len =
+                snprintf(dst, sizeof(dst), "%s/%u-%s", dir, idx, bn);
+            int rel_len =
+                snprintf(rel, sizeof(rel), "assets/%u-%s", idx, bn);
+            if (dst_len < 0 || (size_t) dst_len >= sizeof(dst)
+                    || rel_len < 0 || (size_t) rel_len >= sizeof(rel)
+                    || !copy_plugin_file(d, p, dst)) {
+                LOGW("Could not copy plugin input asset: %s", p);
+                ok = false;
+                continue;
+            }
+            if (!plugin_assets_append(assets, rel)) {
+                unlink(dst);
+                ok = false;
             }
         }
         free(dup);
     }
-    if (started) {
-        sc_strbuf_append_char(eb, ']');
-    }
+    return ok;
 }
 
 // Send {"id":<id>,"ok":true[,<extra>]} (+ optional payload); `extra` must be
@@ -837,7 +959,7 @@ send_hello(struct sc_daemon *d, sc_socket socket) {
 static bool
 acquire_session(struct sc_daemon *d, sc_socket socket, int64_t id) {
     sc_mutex_lock(&d->mutex);
-    if (d->state != SC_DAEMON_STATE_READY || d->stop) {
+    if (d->state != SC_DAEMON_STATE_READY || d->stop || d->session.dead) {
         enum sc_daemon_state state = d->state;
         sc_mutex_unlock(&d->mutex);
         char msg[64];
@@ -1675,7 +1797,14 @@ handle_note(struct sc_daemon *d, sc_socket socket, int64_t id,
         return;
     }
 
+    bool acquired = false;
     if (d->report_active) {
+        if (!acquire_session(d, socket, id)) {
+            free(note);
+            return;
+        }
+        acquired = true;
+
         struct sc_strbuf eb;
         if (sc_strbuf_init(&eb, 128)) {
             const char *colon = strchr(note, ':');
@@ -1707,6 +1836,9 @@ handle_note(struct sc_daemon *d, sc_socket socket, int64_t id,
     }
 
     free(note);
+    if (acquired) {
+        release_session(d);
+    }
     send_ok(socket, id, NULL, NULL, 0);
 }
 
@@ -1750,87 +1882,262 @@ service_sleep_ms(unsigned ms) {
 #endif
 }
 
-// Non-blocking wait: if the child has exited, reap it, store its exit code in
-// *out_code and return true; otherwise (still running, or error) return false.
-static bool
-service_reap_if_exited(sc_pid pid, sc_exit_code *out_code) {
+enum sc_service_process_state {
+    SC_SERVICE_PROCESS_RUNNING,
+    SC_SERVICE_PROCESS_EXITED,
+    SC_SERVICE_PROCESS_ERROR,
+};
+
+// Observe without closing/reaping. The connection keeps exclusive ownership
+// of the pid/handle until it clears plugin_pid under the daemon mutex, which
+// prevents a drain thread from terminating a stale, already-reused identity.
+static enum sc_service_process_state
+service_observe(sc_pid pid, sc_exit_code *out_code) {
 #ifdef _WIN32
     DWORD code;
-    if (GetExitCodeProcess(pid, &code) && code != STILL_ACTIVE) {
-        *out_code = (sc_exit_code) code;
-        CloseHandle(pid);
-        return true;
+    if (!GetExitCodeProcess(pid, &code)) {
+        return SC_SERVICE_PROCESS_ERROR;
     }
-    return false;
+    if (code == STILL_ACTIVE) {
+        return SC_SERVICE_PROCESS_RUNNING;
+    }
+    *out_code = (sc_exit_code) code;
+    return SC_SERVICE_PROCESS_EXITED;
 #else
     siginfo_t info;
     info.si_pid = 0;
-    if (waitid(P_PID, pid, &info, WEXITED | WNOHANG) == -1 || info.si_pid == 0) {
-        return false; // error, or no state change (still running)
+    if (waitid(P_PID, pid, &info, WEXITED | WNOHANG | WNOWAIT) == -1) {
+        if (errno == EINTR) {
+            return SC_SERVICE_PROCESS_RUNNING;
+        }
+        return SC_SERVICE_PROCESS_ERROR;
+    }
+    if (info.si_pid == 0) {
+        return SC_SERVICE_PROCESS_RUNNING;
     }
     *out_code = (info.si_code == CLD_EXITED) ? info.si_status
                                              : SC_EXIT_CODE_NONE;
-    return true;
+    return SC_SERVICE_PROCESS_EXITED;
 #endif
 }
 
-// Terminate an adopted service: SIGTERM, a short grace period, then SIGKILL;
-// reap in all cases.
-static void
+static enum sc_service_process_state
+wait_process_until(sc_pid pid, sc_tick deadline, sc_exit_code *out_code) {
+    for (;;) {
+        enum sc_service_process_state state = service_observe(pid, out_code);
+        if (state != SC_SERVICE_PROCESS_RUNNING) {
+            return state;
+        }
+        if (deadline && sc_tick_now() >= deadline) {
+            return SC_SERVICE_PROCESS_RUNNING;
+        }
+        service_sleep_ms(SC_SERVICE_POLL_MS);
+    }
+}
+
+// Wait indefinitely while the leased device session is usable. Once draining
+// begins, force termination and bound the remaining wait so a failed kill (or
+// an uninterruptible child) cannot prevent completion-event persistence.
+static enum sc_service_process_state
+plugin_wait_for_exit(struct sc_daemon *d, unsigned conn_index, sc_pid pid,
+                     sc_exit_code *out_code) {
+    sc_tick kill_deadline = 0;
+    for (;;) {
+        enum sc_service_process_state state = service_observe(pid, out_code);
+        if (state != SC_SERVICE_PROCESS_RUNNING) {
+            return state;
+        }
+
+        sc_mutex_lock(&d->mutex);
+        bool draining = d->state != SC_DAEMON_STATE_READY || d->stop
+                     || d->session.dead;
+        bool owned = d->conns[conn_index].plugin_pid == pid;
+        sc_mutex_unlock(&d->mutex);
+        if (!owned) {
+            return SC_SERVICE_PROCESS_ERROR;
+        }
+
+        if (draining && !kill_deadline) {
+            if (!sc_process_terminate(pid)) {
+                // A racing exit is success; only a still-running/error state
+                // loses ownership. Crucially, never enter an infinite wait
+                // after the termination request itself failed.
+                state = service_observe(pid, out_code);
+                return state == SC_SERVICE_PROCESS_RUNNING
+                     ? SC_SERVICE_PROCESS_ERROR : state;
+            }
+            kill_deadline =
+                sc_tick_now() + SC_TICK_FROM_MS(SC_SERVICE_KILL_WAIT_MS);
+        }
+        if (kill_deadline && sc_tick_now() >= kill_deadline) {
+            return SC_SERVICE_PROCESS_ERROR;
+        }
+        service_sleep_ms(SC_SERVICE_POLL_MS);
+    }
+}
+
+// Force a process to stop, but never wait forever. The returned EXITED state
+// still owns an unreaped process/handle; the caller must sc_process_close().
+static enum sc_service_process_state
+terminate_process_bounded(sc_pid pid, sc_exit_code *out_code) {
+    if (!sc_process_terminate(pid)) {
+        enum sc_service_process_state state = service_observe(pid, out_code);
+        return state == SC_SERVICE_PROCESS_RUNNING
+             ? SC_SERVICE_PROCESS_ERROR : state;
+    }
+    enum sc_service_process_state state =
+        wait_process_until(
+            pid,
+            sc_tick_now() + SC_TICK_FROM_MS(SC_SERVICE_KILL_WAIT_MS),
+            out_code);
+    return state == SC_SERVICE_PROCESS_RUNNING
+         ? SC_SERVICE_PROCESS_ERROR : state;
+}
+
+// Terminate an adopted service: SIGTERM, a short grace period, then SIGKILL.
+// Reap on success; on a lost process identity, return without blocking.
+static bool
 terminate_service(sc_pid pid) {
 #ifndef _WIN32
     kill(pid, SIGTERM);
     for (unsigned waited = 0; waited < SC_SERVICE_TERM_GRACE_MS;
          waited += SC_SERVICE_POLL_MS) {
         sc_exit_code code;
-        if (service_reap_if_exited(pid, &code)) {
-            return;
+        enum sc_service_process_state state = service_observe(pid, &code);
+        if (state == SC_SERVICE_PROCESS_EXITED) {
+            sc_process_close(pid);
+            return true;
+        }
+        if (state == SC_SERVICE_PROCESS_ERROR) {
+            break;
         }
         service_sleep_ms(SC_SERVICE_POLL_MS);
     }
 #endif
-    sc_process_terminate(pid); // SIGKILL / TerminateProcess
-    sc_process_wait(pid, true); // reap
+    sc_exit_code code = SC_EXIT_CODE_NONE;
+    enum sc_service_process_state state =
+        terminate_process_bounded(pid, &code);
+    if (state == SC_SERVICE_PROCESS_EXITED) {
+        sc_process_close(pid);
+        return true;
+    }
+    LOGE("Could not terminate add-on process within %u ms",
+         SC_SERVICE_KILL_WAIT_MS);
+#ifdef _WIN32
+    // Closing a HANDLE does not wait for or terminate the underlying process.
+    // Do not leak it after ownership could no longer be observed.
+    sc_process_close(pid);
+#endif
+    return false;
 }
 
-// For a service add-on: wait until it writes its result file (signals ready) or
-// exits, whichever first. If it is still alive afterwards, ADOPT it (track for
-// shutdown termination) and return 0; otherwise return its exit code. Clears
-// the connection's plugin_pid tracking either way.
-static sc_exit_code
+struct sc_service_plugin_outcome {
+    bool ready;
+    bool timed_out;
+    bool exited;
+    bool adopted;
+    bool adopt_failed;
+    bool process_error;
+    bool session_ended;
+    bool has_exit_code;
+    sc_exit_code exit_code;
+    enum sc_plugin_result_status result_status;
+    struct sc_plugin_result result;
+};
+
+// Wait until a service writes one complete valid result object (its readiness
+// signal), exits, or reaches the deadline. A partial JSON file is not ready.
+// A still-running process is adopted even on timeout, preserving the existing
+// daemon-managed lifetime while making that degraded outcome explicit.
+static struct sc_service_plugin_outcome
 wait_and_maybe_adopt_service(struct sc_daemon *d, const struct sc_addon *addon,
                              sc_pid pid, const char *result_path,
                              unsigned conn_index) {
-    sc_exit_code code = 0;
-    bool exited = false;
-    for (unsigned waited = 0; waited < SC_SERVICE_READY_TIMEOUT_MS;
-         waited += SC_SERVICE_POLL_MS) {
-        if (service_reap_if_exited(pid, &code)) {
-            exited = true;
+    struct sc_service_plugin_outcome outcome = {
+        .result_status = SC_PLUGIN_RESULT_MISSING,
+    };
+
+    sc_tick deadline =
+        sc_tick_now() + SC_TICK_FROM_MS(SC_SERVICE_READY_TIMEOUT_MS);
+    while (sc_tick_now() < deadline) {
+        struct sc_plugin_result candidate;
+        enum sc_plugin_result_status result_status =
+            sc_plugin_result_read(result_path, SC_PLUGIN_RESULT_MAX_SIZE,
+                                  &candidate);
+        outcome.result_status = result_status;
+        if (result_status == SC_PLUGIN_RESULT_VALID) {
+            outcome.result = candidate;
+            outcome.ready = true;
             break;
         }
-        struct stat st;
-        if (result_path && stat(result_path, &st) == 0 && st.st_size > 0) {
-            break; // reported ready; a final liveness check happens below
+        sc_plugin_result_destroy(&candidate);
+
+        enum sc_service_process_state process_state =
+            service_observe(pid, &outcome.exit_code);
+        if (process_state == SC_SERVICE_PROCESS_EXITED) {
+            outcome.exited = true;
+            outcome.has_exit_code =
+                outcome.exit_code != SC_EXIT_CODE_NONE;
+            break;
+        }
+        if (process_state == SC_SERVICE_PROCESS_ERROR) {
+            outcome.process_error = true;
+            break;
+        }
+
+        sc_mutex_lock(&d->mutex);
+        bool session_ready =
+            d->state == SC_DAEMON_STATE_READY && !d->stop
+            && !d->session.dead;
+        sc_mutex_unlock(&d->mutex);
+        if (!session_ready) {
+            outcome.session_ended = true;
+            break;
         }
         service_sleep_ms(SC_SERVICE_POLL_MS);
     }
-    if (!exited) {
-        // It wrote a result (or timed out) — it may have exited meanwhile.
-        exited = service_reap_if_exited(pid, &code);
+
+    if (!outcome.exited && !outcome.process_error) {
+        // It reported ready (or timed out); close the race with a process exit.
+        enum sc_service_process_state process_state =
+            service_observe(pid, &outcome.exit_code);
+        outcome.exited = process_state == SC_SERVICE_PROCESS_EXITED;
+        outcome.process_error = process_state == SC_SERVICE_PROCESS_ERROR;
+        outcome.has_exit_code = outcome.exited
+                             && outcome.exit_code != SC_EXIT_CODE_NONE;
+    }
+    outcome.timed_out = !outcome.ready && !outcome.exited
+                     && !outcome.process_error && !outcome.session_ended;
+
+    // A one-shot service may write its final result and exit between polls.
+    if (outcome.exited && !outcome.ready) {
+        struct sc_plugin_result final_result;
+        enum sc_plugin_result_status final_status =
+            sc_plugin_result_read(result_path, SC_PLUGIN_RESULT_MAX_SIZE,
+                                  &final_result);
+        outcome.result_status = final_status;
+        if (final_status == SC_PLUGIN_RESULT_VALID) {
+            outcome.result = final_result;
+        } else {
+            sc_plugin_result_destroy(&final_result);
+        }
     }
 
     sc_mutex_lock(&d->mutex);
     d->conns[conn_index].plugin_pid = SC_PROCESS_NONE;
-    bool adopted = false;
-    if (!exited) {
+    bool session_ready =
+        d->state == SC_DAEMON_STATE_READY && !d->stop && !d->session.dead;
+    outcome.session_ended =
+        outcome.session_ended
+        || (!outcome.exited && !outcome.process_error && !session_ready);
+    if (!outcome.exited && !outcome.process_error && session_ready) {
         if (d->service_count < SC_MAX_SERVICES) {
             char *name = strdup(addon->name);
             if (name) {
                 d->services[d->service_count].name = name;
                 d->services[d->service_count].pid = pid;
                 d->service_count++;
-                adopted = true;
+                outcome.adopted = true;
             }
         } else {
             LOGW("Too many service add-ons (max %d); terminating \"%s\"",
@@ -1839,16 +2146,27 @@ wait_and_maybe_adopt_service(struct sc_daemon *d, const struct sc_addon *addon,
     }
     sc_mutex_unlock(&d->mutex);
 
-    if (!exited && !adopted) {
+    if (outcome.exited) {
+        // plugin_pid no longer exposes this identity; it is now safe to reap.
+        sc_process_close(pid);
+    } else if (outcome.process_error) {
+        // Ownership could no longer be proven (for example ECHILD or an
+        // invalid HANDLE). Never signal a possibly reused process identity.
+        LOGE("Lost ownership of service add-on process \"%s\"", addon->name);
+#ifdef _WIN32
+        // CloseHandle only releases this process' reference; it does not kill
+        // a still-running child.
+        sc_process_close(pid);
+#endif
+    } else if (!outcome.adopted) {
+        outcome.adopt_failed = !outcome.process_error && session_ready;
         terminate_service(pid); // overflow / OOM: don't leak the process
-        return SC_EXIT_CODE_NONE;
     }
-    if (adopted) {
+    if (outcome.adopted) {
         LOGI("Service add-on \"%s\" started and adopted (pid %ld)",
              addon->name, (long) pid);
-        return 0;
     }
-    return code; // one-shot: it exited on its own
+    return outcome;
 }
 
 // Run a loaded add-on (doc/addons.md). The op runs the entrypoint script with
@@ -1860,19 +2178,23 @@ wait_and_maybe_adopt_service(struct sc_daemon *d, const struct sc_addon *addon,
 static void
 handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
               const struct sc_json *json, unsigned conn_index) {
-    char *name;
+    char *name = NULL;
     if (!sc_json_get_string(json, "name", &name)) {
         send_error(socket, id, "E_BAD_REQUEST", "expected plugin \"name\"");
         return;
     }
     char *args = NULL;
     sc_json_get_string(json, "args", &args); // optional
-    char *result_path = NULL; // SC_RESULT_FILE temp path (cleaned at end)
+    struct sc_plugin_assets assets = {0};
+    struct sc_plugin_result result = {0};
+    enum sc_plugin_result_status result_status = SC_PLUGIN_RESULT_MISSING;
+    const char *result_json = NULL;
+    char *result_path = NULL;
 
     // Optional named arguments (parallel string arrays), each exported to the
     // script as SC_ARG_<NAME>; the primary value stays available as $1.
-    char *arg_names[SC_MAX_ADDON_ARGS];
-    char *arg_values[SC_MAX_ADDON_ARGS];
+    char *arg_names[SC_MAX_ADDON_ARGS] = {0};
+    char *arg_values[SC_MAX_ADDON_ARGS] = {0};
     unsigned name_count = 0, value_count = 0;
     bool has_names = sc_json_get_string_array(json, "arg_names", arg_names,
                                               SC_MAX_ADDON_ARGS, &name_count);
@@ -1881,7 +2203,7 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
     if (has_names != has_values || name_count != value_count) {
         send_error(socket, id, "E_BAD_REQUEST",
                    "arg_names/arg_values must be matching string arrays");
-        goto end;
+        goto cleanup;
     }
 
     const struct sc_addon *addon = sc_addons_get(&d->addons, name);
@@ -1889,35 +2211,55 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
         char msg[128];
         snprintf(msg, sizeof(msg), "no add-on provides --%s", name);
         send_error(socket, id, "E_BAD_REQUEST", msg);
-        goto end;
+        goto cleanup;
     }
-    const char *path = addon->path;
+
+    // A plugin invocation owns a session lease through completion-event
+    // persistence. This keeps the report gate open if the device disconnects
+    // while the child is running.
+    if (!acquire_session(d, socket, id)) {
+        goto cleanup;
+    }
+    bool acquired = true;
+    bool send_response = true;
+    bool response_ok = false;
+    const char *response_error_code = "E_INTERNAL";
+    char response_error[256] = "plugin invocation failed";
+
+    bool report_timed =
+        d->report_active && atomic_load(&d->report_initialized);
+    int64_t start_ms = 0;
+    int64_t end_ms = 0;
+    if (report_timed
+            && !sc_report_get_timeline_time_ms(&d->report, &start_ms)) {
+        sc_report_mark_failed(&d->report);
+        snprintf(response_error, sizeof(response_error),
+                 "report timeline anchor is unavailable");
+        goto finish;
+    }
+
+    const char *status = "start_failed";
+    bool has_exit_code = false;
+    int64_t exit_code = 0;
+    bool adopted = false;
+
+    if (!collect_plugin_assets(d, addon, arg_names, arg_values, name_count,
+                               &assets)) {
+        // The original path inputs remain in the event, but a report missing
+        // one of its promised bundled assets must not be marked finalized.
+        if (report_timed) {
+            sc_report_mark_failed(&d->report);
+        }
+    }
 
     const char *missing = sc_addon_missing_env(addon);
     if (missing) {
-        char msg[192];
-        snprintf(msg, sizeof(msg),
-                 "add-on --%s requires environment variable %s", name, missing);
-        send_error(socket, id, "E_PLUGIN", msg);
-        goto end;
-    }
-
-    // Auto-log the plugin start event so it always appears on the timeline
-    if (d->report_active) {
-        struct sc_strbuf eb;
-        if (sc_strbuf_init(&eb, 128)) {
-            bool w = sc_strbuf_append_staticstr(&eb, "\"name\":")
-                  && sc_json_append_escaped(&eb, name)
-                  && sc_strbuf_append_staticstr(&eb, ",\"args\":")
-                  && sc_json_append_escaped(&eb, args ? args : "");
-            if (w) {
-                // Preserve any reference-image (path) args in the report bundle
-                copy_plugin_assets(d, addon, arg_names, arg_values, name_count,
-                                   &eb);
-                report_log(d, "plugin", NULL, eb.s);
-            }
-            free(eb.s);
-        }
+        status = "missing_env";
+        response_error_code = "E_PLUGIN";
+        snprintf(response_error, sizeof(response_error),
+                 "add-on --%s requires environment variable %s", name,
+                 missing);
+        goto finish_with_assets;
     }
 
     // Runtime info for the script
@@ -1976,104 +2318,287 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
         e_port, e_host, e_serial, e_report, e_name, e_w, e_h, e_exe, e_result,
         e_codec, e_brate, e_mfps, e_msize, e_enc, e_ctrl};
     unsigned env_count = 15;
-    char *arg_env[1 + SC_MAX_ADDON_ARGS];
+    char *arg_env[1 + SC_MAX_ADDON_ARGS] = {0};
     unsigned arg_env_count = 0;
+    bool env_ok = true;
 
     char *primary_env = make_arg_env(name, args ? args : "");
     if (primary_env) {
         arg_env[arg_env_count++] = primary_env;
         env[env_count++] = primary_env;
+    } else {
+        env_ok = false;
     }
     for (unsigned i = 0; i < name_count; ++i) {
         char *e = make_arg_env(arg_names[i], arg_values[i]);
         if (e) {
             arg_env[arg_env_count++] = e;
             env[env_count++] = e;
+        } else {
+            env_ok = false;
         }
     }
 
-    sc_pid pid;
-    bool started = sc_addon_run(path, args, env, env_count, &pid);
+    sc_pid pid = SC_PROCESS_NONE;
+    bool session_usable = plugin_copy_may_continue(d);
+    bool started =
+        env_ok && session_usable
+        && sc_addon_run(addon->path, args, env, env_count, &pid);
     free(exe);
     // The env strings were copied into the child at exec time; safe to free now
     for (unsigned i = 0; i < arg_env_count; ++i) {
         free(arg_env[i]);
     }
     if (!started) {
-        send_error(socket, id, "E_INTERNAL", "could not start add-on");
-        goto end;
+        if (!session_usable) {
+            status = "error";
+            snprintf(response_error, sizeof(response_error),
+                     "device session ended before starting add-on");
+        } else {
+            snprintf(response_error, sizeof(response_error),
+                     "%s", env_ok ? "could not start add-on"
+                                  : "could not prepare add-on environment");
+        }
+        goto finish_result_path;
     }
 
-    // Register the pid so a shutdown mid-run terminates the child
+    // Publish process ownership only while the leased session is still
+    // READY. This closes the acquire->fork window where a drain could scan
+    // before plugin_pid existed and then wait forever for the new child.
     sc_mutex_lock(&d->mutex);
-    d->conns[conn_index].plugin_pid = pid;
+    bool pid_published =
+        d->state == SC_DAEMON_STATE_READY && !d->stop && !d->session.dead;
+    if (pid_published) {
+        d->conns[conn_index].plugin_pid = pid;
+    }
     sc_mutex_unlock(&d->mutex);
+    if (!pid_published) {
+        sc_exit_code code = SC_EXIT_CODE_NONE;
+        enum sc_service_process_state process_state =
+            terminate_process_bounded(pid, &code);
+        if (process_state == SC_SERVICE_PROCESS_EXITED) {
+            sc_process_close(pid);
+        } else {
+            LOGE("Could not terminate add-on process while session ended");
+#ifdef _WIN32
+            sc_process_close(pid);
+#endif
+        }
+        if (result_path) {
+            result_status =
+                sc_plugin_result_read(result_path,
+                                      SC_PLUGIN_RESULT_MAX_SIZE, &result);
+        }
+        has_exit_code = process_state == SC_SERVICE_PROCESS_EXITED
+                     && code != SC_EXIT_CODE_NONE;
+        if (has_exit_code) {
+            exit_code = (int64_t) code;
+        }
+        status = "error";
+        snprintf(response_error, sizeof(response_error),
+                 "device session ended while starting add-on");
+        goto finish_result_path;
+    }
 
-    sc_exit_code code;
     if (addon->service) {
-        // Long-running: wait until it reports ready or exits, then adopt it if
-        // still alive (kept running past this response, killed at shutdown).
-        code = wait_and_maybe_adopt_service(d, addon, pid, result_path,
-                                            conn_index);
+        struct sc_service_plugin_outcome service =
+            wait_and_maybe_adopt_service(d, addon, pid, result_path,
+                                         conn_index);
+        result = service.result;
+        result_status = service.result_status;
+        adopted = service.adopted;
+        has_exit_code = service.has_exit_code;
+        if (has_exit_code) {
+            exit_code = (int64_t) service.exit_code;
+        }
+
+        if (service.process_error) {
+            status = "error";
+            snprintf(response_error, sizeof(response_error),
+                     "could not observe service add-on process");
+        } else if (service.session_ended) {
+            status = "error";
+            snprintf(response_error, sizeof(response_error),
+                     "device session ended before service adoption");
+        } else if (service.adopt_failed) {
+            status = "adopt_failed";
+            snprintf(response_error, sizeof(response_error),
+                     "could not adopt service add-on");
+        } else if (service.exited) {
+            if (service.has_exit_code && service.exit_code == 0) {
+                if (result_status == SC_PLUGIN_RESULT_INVALID
+                        || result_status == SC_PLUGIN_RESULT_TOO_LARGE
+                        || result_status == SC_PLUGIN_RESULT_IO_ERROR) {
+                    status = "invalid_result";
+                    response_error_code = "E_PLUGIN";
+                    snprintf(response_error, sizeof(response_error),
+                             "add-on produced an invalid result");
+                } else {
+                    status = "ok";
+                    response_ok = true;
+                }
+            } else {
+                status = "error";
+                if (service.has_exit_code) {
+                    snprintf(response_error, sizeof(response_error),
+                             "add-on exited with code %" PRId64, exit_code);
+                } else {
+                    snprintf(response_error, sizeof(response_error),
+                             "add-on was terminated");
+                }
+            }
+        } else if (service.timed_out) {
+            status = "ready_timeout";
+            response_ok = true;
+        } else {
+            assert(service.ready && service.adopted);
+            status = "ready";
+            response_ok = true;
+        }
     } else {
-        code = sc_process_wait(pid, true);
+        // Observe termination without reaping/closing until plugin_pid has
+        // been cleared under the same mutex used by the drain thread.
+        sc_exit_code code = SC_EXIT_CODE_NONE;
+        enum sc_service_process_state process_state =
+            plugin_wait_for_exit(d, conn_index, pid, &code);
         sc_mutex_lock(&d->mutex);
         d->conns[conn_index].plugin_pid = SC_PROCESS_NONE;
         sc_mutex_unlock(&d->mutex);
+        if (process_state == SC_SERVICE_PROCESS_EXITED) {
+            sc_process_close(pid);
+        } else {
+            LOGE("Lost ownership of add-on process \"%s\"", addon->name);
+#ifdef _WIN32
+            // CloseHandle only releases local ownership and never terminates
+            // the underlying process.
+            sc_process_close(pid);
+#endif
+        }
+
+        if (result_path) {
+            result_status =
+                sc_plugin_result_read(result_path,
+                                      SC_PLUGIN_RESULT_MAX_SIZE, &result);
+        }
+        has_exit_code = process_state == SC_SERVICE_PROCESS_EXITED
+                     && code != SC_EXIT_CODE_NONE;
+        if (has_exit_code) {
+            exit_code = (int64_t) code;
+        }
+        if (process_state == SC_SERVICE_PROCESS_ERROR) {
+            status = "error";
+            snprintf(response_error, sizeof(response_error),
+                     "could not observe add-on process");
+        } else if (has_exit_code && code == 0) {
+            if (result_status == SC_PLUGIN_RESULT_INVALID
+                    || result_status == SC_PLUGIN_RESULT_TOO_LARGE
+                    || result_status == SC_PLUGIN_RESULT_IO_ERROR) {
+                status = "invalid_result";
+                response_error_code = "E_PLUGIN";
+                snprintf(response_error, sizeof(response_error),
+                         "add-on produced an invalid result");
+            } else {
+                status = "ok";
+                response_ok = true;
+            }
+        } else {
+            status = "error";
+            if (has_exit_code) {
+                snprintf(response_error, sizeof(response_error),
+                         "add-on exited with code %" PRId64, exit_code);
+            } else {
+                snprintf(response_error, sizeof(response_error),
+                         "add-on was terminated");
+            }
+        }
     }
 
-    // Read back the structured result the script wrote (if any, valid JSON)
-    char *result_json = NULL;
+finish_result_path:
     if (result_path) {
-        result_json = read_result_file(result_path);
         unlink(result_path);
         free(result_path);
         result_path = NULL;
     }
 
-    // Record the plugin's structured result on the report timeline (at the end
-    // of the operation) so the report can show the full result JSON.
-    if (result_json && d->report_active) {
-        struct sc_strbuf rb;
-        if (sc_strbuf_init(&rb, 256)) {
-            if (sc_strbuf_append_staticstr(&rb, "\"name\":")
-                    && sc_json_append_escaped(&rb, name)
-                    && sc_strbuf_append_staticstr(&rb, ",\"result\":")
-                    && sc_strbuf_append_str(&rb, result_json)) {
-                report_log(d, "result", NULL, rb.s);
+    result_json =
+        result_status == SC_PLUGIN_RESULT_VALID ? result.json : NULL;
+
+finish_with_assets:
+    if (report_timed) {
+        if (!sc_report_get_timeline_time_ms(&d->report, &end_ms)) {
+            sc_report_mark_failed(&d->report);
+        } else {
+            struct sc_plugin_named_input named[SC_MAX_ADDON_ARGS];
+            for (unsigned i = 0; i < name_count; ++i) {
+                named[i].name = arg_names[i];
+                named[i].value = arg_values[i];
             }
-            free(rb.s);
+
+            struct sc_plugin_completion_event event = {
+                .name = name,
+                .args = args,
+                .named = named,
+                .named_count = name_count,
+                .assets = (const char *const *) assets.items,
+                .asset_count = assets.count,
+                .start_ms = start_ms,
+                .end_ms = end_ms,
+                .duration_ms = end_ms - start_ms,
+                .result_json = result_json,
+                .status = status,
+                .has_exit_code = has_exit_code,
+                .exit_code = exit_code,
+                .service = addon->service,
+                .adopted = adopted,
+            };
+            char *extra = NULL;
+            bool serialized =
+                sc_plugin_event_serialize_extra(&event, &extra);
+            bool logged = serialized
+                       && sc_report_log_event_at(&d->report, end_ms, "plugin",
+                                                 NULL, extra);
+            free(extra);
+            if (!logged) {
+                sc_report_mark_failed(&d->report);
+            }
         }
     }
 
-    if (code == 0) {
-        bool sent = false;
-        if (result_json) {
-            struct sc_strbuf eb;
-            if (sc_strbuf_init(&eb, 256)) {
-                if (sc_strbuf_append_staticstr(&eb, "\"result\":")
+finish:
+    // Persist the completion event above before allowing session finalization.
+    if (acquired) {
+        release_session(d);
+        acquired = false;
+    }
+
+    if (send_response) {
+        if (response_ok) {
+            if (result_json) {
+                struct sc_strbuf eb = {0};
+                if (sc_strbuf_init(&eb, 256)
+                        && sc_strbuf_append_staticstr(&eb, "\"result\":")
                         && sc_strbuf_append_str(&eb, result_json)) {
                     send_ok(socket, id, eb.s, NULL, 0);
-                    sent = true;
+                } else {
+                    send_error(socket, id, "E_INTERNAL",
+                               "could not serialize add-on result");
                 }
                 free(eb.s);
+            } else {
+                send_ok(socket, id, NULL, NULL, 0);
             }
+        } else {
+            send_error(socket, id, response_error_code, response_error);
         }
-        if (!sent) {
-            send_ok(socket, id, NULL, NULL, 0);
-        }
-    } else {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "add-on exited with code %d", (int) code);
-        send_error(socket, id, "E_INTERNAL", msg);
     }
-    free(result_json);
 
-end:
+cleanup:
     if (result_path) {
         unlink(result_path);
         free(result_path);
     }
+    plugin_assets_destroy(&assets);
+    sc_plugin_result_destroy(&result);
     for (unsigned i = 0; i < name_count; ++i) {
         free(arg_names[i]);
     }
@@ -2242,7 +2767,8 @@ handle_request(struct sc_daemon *d, sc_socket socket, const char *json_str,
         } else {
             // Ready check only; the broadcaster sends video_meta as the ack
             sc_mutex_lock(&d->mutex);
-            bool ready = d->state == SC_DAEMON_STATE_READY && !d->stop;
+            bool ready = d->state == SC_DAEMON_STATE_READY && !d->stop
+                      && !d->session.dead;
             sc_mutex_unlock(&d->mutex);
             if (ready) {
                 action = SC_CONN_SUBSCRIBE_VIDEO;
@@ -2452,7 +2978,20 @@ static void
 sc_daemon_drain_requests(struct sc_daemon *d, enum sc_daemon_state state) {
     sc_mutex_lock(&d->mutex);
     sc_daemon_set_state_locked(d, state);
+    // A plugin request holds a session lease until its single completion
+    // event is persisted. Terminate children that are still running so a
+    // device disconnect or daemon stop cannot wait forever before closing the
+    // report gate. The waiting connection thread reaps the child, logs the
+    // failure outcome, then releases its lease.
     while (d->in_flight) {
+        // Repeat on every wake as a defensive fallback for a child published
+        // at the READY->draining boundary.
+        for (unsigned i = 0; i < SC_DAEMON_MAX_CLIENTS; ++i) {
+            sc_pid pid = d->conns[i].plugin_pid;
+            if (pid != SC_PROCESS_NONE) {
+                sc_process_terminate(pid);
+            }
+        }
         if (g_stop_signal) {
             // Cannot abort in-flight requests, but record the stop request
             // so that the supervisor exits once they complete
@@ -2516,7 +3055,7 @@ sc_daemon_run(struct scrcpy_options *opts) {
         goto end;
     }
     broadcaster_ok = true;
-    if (!sc_clip_buffer_init(&d->clips)) {
+    if (!sc_clip_buffer_init(&d->clips, &d->keeper)) {
         goto end;
     }
     clips_ok = true;

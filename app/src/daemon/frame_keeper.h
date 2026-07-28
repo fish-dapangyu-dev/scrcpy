@@ -27,12 +27,14 @@ struct sc_frame_keeper {
     AVFrame *tmp; // preserve latest on av_frame_ref() error
     sc_tick last_frame_tick; // when `latest` was received
     struct sc_size size; // dimensions of `latest` (0x0 if none yet)
-    // Video PTS (µs) for frame-accurate test-report correlation
-    // Host tick when the first frame was received (0 until then). Report
+    // Host tick and media PTS of the first successfully retained decoded
+    // frame. Together they are the single report/clip/event timeline anchor.
+    // Report
     // event times are wall-clock elapsed from here — the mp4 plays back in
     // real time (static screens hold a frame), whereas the encoder emits
     // frames only on change, so frame PTS would freeze during static periods.
     sc_tick first_frame_tick;
+    int64_t first_frame_pts;
     // Freeze the session clock when the sink closes. Without this, a stopped
     // session would appear to keep recording while its report is finalized.
     sc_tick session_end_tick;
@@ -88,6 +90,16 @@ sc_frame_keeper_reset(struct sc_frame_keeper *fk);
  */
 bool
 sc_frame_keeper_video_time_ms(struct sc_frame_keeper *fk, int64_t *out_ms);
+
+/**
+ * Read the immutable first decoded-frame timeline anchor.
+ *
+ * Returns false until the first decoded frame with a valid media PTS has been
+ * successfully retained. On success, either output pointer may be NULL.
+ */
+bool
+sc_frame_keeper_get_timeline_anchor(struct sc_frame_keeper *fk,
+                                    sc_tick *out_tick, int64_t *out_pts);
 
 /**
  * Get the dimensions of the latest frame (the video size), waiting until

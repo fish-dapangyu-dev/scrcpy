@@ -470,7 +470,7 @@ allowing pipelining (v1 clients send sequentially, the field future-proofs).
 | `set_display_power` | `on` (boolean) | — |
 | `expand_notification_panel` / `expand_settings_panel` / `collapse_panels` / `rotate_device` / `open_hard_keyboard_settings` / `reset_video` | — | —; direct mappings of the corresponding upstream control messages |
 | `note` | `note`: a `"title: description"` annotation | — (logged to the test report as a `note` event with `title`/`text`; standalone, not tied to any control command) |
-| `plugin` | `name`, `args`, optional `arg_names`/`arg_values` (parallel string arrays of the declared extra arguments) | runs the loaded add-on registered for `name` with `args` as `$1`, each extra argument exported as `SC_ARG_<NAME>`, and a `SC_RESULT_FILE` temp path (doc/addons.md); blocks until the script exits; auto-logs a `plugin` report event; returns `result` (the JSON the script wrote to `SC_RESULT_FILE`, if any) |
+| `plugin` | `name`, `args`, optional `arg_names`/`arg_values` (parallel string arrays of the declared extra arguments) | runs the loaded add-on registered for `name` with `args` as `$1`, each extra argument exported as `SC_ARG_<NAME>`, and a `SC_RESULT_FILE` temp path (doc/addons.md); blocks until a one-shot exits or a service reaches ready/exit/timeout; returns `result` when the script produced valid JSON; writes exactly one completion-form `plugin` report event containing `name`, complete `inputs`, copied `assets`, `start_ms`, end `t_ms`/`wall`, `duration_ms`, `result`, `status`, `exit_code`, `service`, `adopted`, and optional `active_duration_ms` |
 | `upload` | `name` (a basename), `payload_len` + that many raw payload bytes after the JSON frame | stores the payload in a per-connection temp file (removed on disconnect) and returns its daemon-side `path`; used to ship a `path`/`pathlist` argument's bytes when the client (or web server) is remote |
 | `clip` | `start_ms`, `end_ms` (ms on the report/session timeline, `0 <= start < end`) | `start_ms`, `end_ms` (actual clip bounds: start snaps back to a keyframe; end stays exact), `source_end_ms`, `held_tail_ms`, `codec`, `container`, `extension`, `mime_type`, and `payload_len` + a standalone video payload. VP8 is muxed as WebM; H.264/H.265/AV1/VP9 are muxed as MP4. The daemon spools encoded packets independently of the report recorder and muxes the selected range in memory with timestamps rebased to 0; the CLIENT writes the file. An `end_ms` beyond the elapsed encoded-stream timeline is `E_RANGE`; compatible encoder refresh epochs may be crossed, while an incompatible codec/config/geometry boundary is `E_SESSION`; flex-display clips are `E_UNSUPPORTED`; output beyond the 1 GiB binary-frame bound is `E_TOO_LARGE`. |
 | `subscribe_video` | — | turns the connection into a one-way encoded-video push stream (see §8.7); no `ok` reply — the first `video_meta` event is the ack |
@@ -658,6 +658,23 @@ device sends config + first IDR within ~100 ms of encoder start).
 `screencap` therefore waits on the keeper's condvar with a deadline
 (default 2 s, `E_TIMEOUT` after) instead of failing instantly.
 
+For a video report session, the keeper also defines the **only** timeline
+anchor: the host monotonic tick and media PTS of the first decoded frame that
+is successfully retained by the frame sink. This instant is `t_ms = 0`.
+Connection setup, codec config and encoded preroll are outside the report
+timeline. The daemon does not emit synthetic zero-time events while waiting
+for that frame. The anchor is cleared with the frame keeper when a session is
+restarted (including a daemon/video-configuration restart).
+
+There are deliberately two projections of this one anchor:
+
+- event timestamps use monotonic host elapsed time from the anchor tick;
+- video, clip and recorder timestamps use media PTS relative to the anchor
+  PTS.
+
+They share the same zero while retaining the clock appropriate to each kind
+of data; no later tolerance or renderer adjustment may move event positions.
+
 ### 9.4 Freshness (`max_age_ms`) and `RESET_VIDEO`
 
 If a request sets `max_age_ms` and `now - last_frame_tick` exceeds it, the
@@ -673,8 +690,26 @@ restarts the encoder, costing ~100–300 ms.
 The clip spool stores encoded packets and their original PTS. Packet PTS is
 not an availability clock: Android MediaCodec may emit nothing for many
 seconds while the display is static. The report/event clock therefore uses
-monotonic elapsed time since the first encoded media packet (the same origin
-as packet PTS 0), and `clip.end_ms` is checked only against that stream clock.
+monotonic host elapsed time from the retained-frame anchor described in §9.3,
+while clip packet positions use media PTS relative to that anchor's media PTS.
+`clip.end_ms` is checked against the anchored session clock, not packet
+availability and not daemon process uptime.
+
+The report recorder is configured with this media origin explicitly. It may
+queue encoded preroll while decoding is waiting for the anchor, but discards
+every packet whose PTS precedes the origin. Its first retained media packet
+must hit the anchor exactly and be a keyframe; a gap or delta-frame origin is
+an error rather than permission to silently shift the recording timeline or
+write an independently undecodable file. Thus `recording.*`, extracted clips
+and `events.jsonl` agree on zero without rewriting event timestamps.
+
+Closing the encoded-stream wrapper does **not** immediately stop the report
+recorder. Packet sinks close in reverse registration order, before the decoder
+closes the frame keeper and before the daemon has closed the event gate. The
+daemon first drains in-flight requests, freezes the keeper clock and rejects
+new events; report finalization then publishes that authoritative end to the
+recorder and stops it. This ordering guarantees that a late accepted event
+cannot land beyond an already-finalized video.
 
 Extraction selects packets in the half-open range `[start_ms, end_ms)`,
 snapping the start back to a decodable keyframe. Every selected packet keeps
@@ -688,9 +723,10 @@ The response separates:
 - `source_end_ms`: the last included encoded packet position;
 - `held_tail_ms`: `end_ms - source_end_ms`.
 
-The session clock freezes when the encoded packet sink closes. A request beyond that
-frozen position returns `E_RANGE`; small process-termination corrections are
-an upper-layer policy and the daemon never silently truncates a Case.
+The anchored session clock freezes when the frame keeper closes. A request
+beyond that frozen position returns `E_RANGE`; small process-termination
+corrections are an upper-layer policy and the daemon never silently truncates
+a Case.
 
 The spool keeps codec parameters and config per stream-session epoch. A clip
 must be internally decodable with one codec/geometry description. Encoder
@@ -764,6 +800,11 @@ The `feat/control` executor is reused with two changes:
 - Requests in flight when the device drops get `E_DEVICE_DISCONNECTED`.
   In-progress touch gestures are simply lost (matching what a cable pull does
   to one-shot mode).
+- A plugin request holds the session until it reaches a completion state. On
+  disconnect or shutdown, the daemon first terminates its in-flight child,
+  waits for the request to write its completion-form `plugin` event, and only
+  then closes the report. This prevents the final result/error and duration
+  from disappearing behind report finalization.
 - The IPC listener stays up during reconnection — clients get structured
   errors rather than connection refused, and `status` works throughout.
 

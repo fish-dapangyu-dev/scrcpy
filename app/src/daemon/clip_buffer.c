@@ -10,6 +10,7 @@
 #include <libavformat/avformat.h>
 
 #include "compat.h"
+#include "daemon/frame_keeper.h"
 #include "daemon/protocol.h"
 #include "util/log.h"
 
@@ -91,8 +92,6 @@ reset_locked(struct sc_clip_buffer *cb) {
     cb->entries = NULL;
     cb->count = 0;
     cb->cap = 0;
-    cb->first_packet_tick = 0;
-    cb->session_end_tick = 0;
     cb->failed = false;
 }
 
@@ -122,9 +121,11 @@ sc_clip_buffer_packet_sink_push_session(
         const struct sc_stream_session *session);
 
 bool
-sc_clip_buffer_init(struct sc_clip_buffer *cb) {
+sc_clip_buffer_init(struct sc_clip_buffer *cb,
+                    struct sc_frame_keeper *timeline) {
     memset(cb, 0, sizeof(*cb));
     cb->fd = -1;
+    cb->timeline = timeline;
 
     static const struct sc_packet_sink_ops ops = {
         .open = sc_clip_buffer_packet_sink_open,
@@ -145,12 +146,17 @@ sc_clip_buffer_destroy(struct sc_clip_buffer *cb) {
 
 bool
 sc_clip_buffer_source_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms) {
+    int64_t origin;
+    if (!sc_frame_keeper_get_timeline_anchor(cb->timeline, NULL, &origin)) {
+        return false;
+    }
+
     sc_mutex_lock(&cb->mutex);
-    bool ok = cb->count != 0;
+    bool ok = cb->count != 0
+           && cb->entries[cb->count - 1].pts >= origin;
     if (ok) {
-        int64_t first = cb->entries[0].pts;
         int64_t last = cb->entries[cb->count - 1].pts;
-        *out_ms = (last - first) / 1000;
+        *out_ms = (last - origin) / 1000;
     }
     sc_mutex_unlock(&cb->mutex);
     return ok;
@@ -158,18 +164,7 @@ sc_clip_buffer_source_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms) {
 
 bool
 sc_clip_buffer_timeline_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms) {
-    sc_mutex_lock(&cb->mutex);
-    bool ok = cb->first_packet_tick != 0;
-    if (ok) {
-        sc_tick end = cb->session_end_tick ? cb->session_end_tick
-                                           : sc_tick_now();
-        *out_ms = SC_TICK_TO_MS(end - cb->first_packet_tick);
-        if (*out_ms < 0) {
-            *out_ms = 0;
-        }
-    }
-    sc_mutex_unlock(&cb->mutex);
-    return ok;
+    return sc_frame_keeper_video_time_ms(cb->timeline, out_ms);
 }
 
 // ---- packet sink trait ------------------------------------------------------
@@ -271,9 +266,6 @@ static void
 sc_clip_buffer_packet_sink_close(struct sc_packet_sink *sink) {
     struct sc_clip_buffer *cb = DOWNCAST(sink);
     sc_mutex_lock(&cb->mutex);
-    if (cb->first_packet_tick && !cb->session_end_tick) {
-        cb->session_end_tick = sc_tick_now();
-    }
     // Keep the spool: already-recorded ranges stay clippable until the next
     // session (or daemon exit)
     cb->opened = false;
@@ -286,9 +278,6 @@ sc_clip_buffer_packet_sink_push(struct sc_packet_sink *sink,
     struct sc_clip_buffer *cb = DOWNCAST(sink);
 
     sc_mutex_lock(&cb->mutex);
-    if (packet->pts != AV_NOPTS_VALUE && !cb->first_packet_tick) {
-        cb->first_packet_tick = sc_tick_now();
-    }
     if (!cb->opened || cb->fd == -1) {
         goto out; // spool unavailable: drop silently, never block the stream
     }
@@ -376,6 +365,23 @@ last_before(const struct sc_clip_entry *entries, size_t count, int64_t t) {
         }
     }
     return res;
+}
+
+static int
+find_timeline_origin(const struct sc_clip_entry *entries, size_t count,
+                     int64_t origin, size_t *out_index) {
+    size_t index = 0;
+    while (index < count && entries[index].pts < origin) {
+        ++index;
+    }
+    if (index == count) {
+        return SC_CLIP_ERANGE;
+    }
+    if (entries[index].pts != origin || !entries[index].key) {
+        return SC_CLIP_EINTERNAL;
+    }
+    *out_index = index;
+    return 0;
 }
 
 bool
@@ -523,6 +529,12 @@ sc_clip_packet_duration_us(const struct sc_clip_entry *entries, size_t count,
     return packet_duration_us(entries, count, index, end_us);
 }
 
+int
+sc_clip_find_timeline_origin(const struct sc_clip_entry *entries, size_t count,
+                             int64_t origin, size_t *out_index) {
+    return find_timeline_origin(entries, count, origin, out_index);
+}
+
 bool
 sc_clip_epochs_compatible(const struct sc_clip_epoch *a,
                           const struct sc_clip_epoch *b) {
@@ -666,6 +678,13 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
                        char *errbuf, size_t errbuf_size) {
     assert(start_ms >= 0 && end_ms > start_ms);
 
+    int64_t first;
+    if (!sc_frame_keeper_get_timeline_anchor(cb->timeline, NULL, &first)) {
+        snprintf(errbuf, errbuf_size,
+                 "no decoded video frame has been recorded yet");
+        return SC_CLIP_ERANGE;
+    }
+
     sc_mutex_lock(&cb->mutex);
 
     if (cb->failed) {
@@ -681,7 +700,6 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
         return SC_CLIP_ERANGE;
     }
 
-    int64_t first = cb->entries[0].pts;
     if (end_ms > available_end_ms) {
         snprintf(errbuf, errbuf_size,
                  "clip end %" PRId64 ".%03" PRId64 "s is beyond the recorded "
@@ -695,21 +713,49 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
     int64_t start_us = first + start_ms * 1000;
     int64_t end_us = first + end_ms * 1000;
 
-    size_t begin;
-    size_t stop;
+    // Packets preceding the first decoded frame are decoder preroll, not
+    // visible negative report time.
+    size_t timeline_begin;
+    int origin_ret =
+        find_timeline_origin(cb->entries, cb->count, first, &timeline_begin);
+    if (origin_ret == SC_CLIP_ERANGE) {
+        snprintf(errbuf, errbuf_size,
+                 "no video packets at or after the first decoded frame");
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_ERANGE;
+    }
+    if (origin_ret == SC_CLIP_EINTERNAL) {
+        // Starting before the decoded-frame origin would invent negative
+        // report time; starting after it would omit visible content. Refuse
+        // the clip instead of silently compromising either invariant.
+        snprintf(errbuf, errbuf_size,
+                 "first decoded frame has no matching encoded keyframe");
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_EINTERNAL;
+    }
+
+    const struct sc_clip_entry *timeline_entries =
+        &cb->entries[timeline_begin];
+    size_t timeline_count = cb->count - timeline_begin;
+    size_t begin_rel;
+    size_t stop_rel;
     int64_t boundary_us = 0;
     int select_ret =
-        sc_clip_select_epoch(cb->entries, cb->count, start_us, end_us,
-                             &begin, &stop, &boundary_us);
+        sc_clip_select_epoch(timeline_entries, timeline_count, start_us,
+                             end_us, &begin_rel, &stop_rel, &boundary_us);
+    size_t begin = 0;
+    size_t stop = 0;
     if (select_ret == SC_CLIP_ESESSION) {
         // A keyframe-only encoder refresh (for example an explicit freshness
         // reset) is transparent when codec parameters and config are exactly
         // unchanged. Geometry/config changes remain hard boundaries.
-        if (!sc_clip_select(cb->entries, cb->count, start_us, end_us,
-                            &begin, &stop)) {
+        if (!sc_clip_select(timeline_entries, timeline_count, start_us, end_us,
+                            &begin_rel, &stop_rel)) {
             select_ret = SC_CLIP_ERANGE;
         } else {
             select_ret = 0;
+            begin = timeline_begin + begin_rel;
+            stop = timeline_begin + stop_rel;
             uint32_t previous_index = cb->entries[begin].epoch;
             if (previous_index >= cb->epoch_count) {
                 select_ret = SC_CLIP_EINTERNAL;
@@ -729,6 +775,9 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
                 previous_index = current_index;
             }
         }
+    } else if (!select_ret) {
+        begin = timeline_begin + begin_rel;
+        stop = timeline_begin + stop_rel;
     }
     if (select_ret == SC_CLIP_ESESSION) {
         int64_t boundary_ms = (boundary_us - first) / 1000;

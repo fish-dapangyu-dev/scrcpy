@@ -10,7 +10,8 @@
 
 #include "trait/packet_sink.h"
 #include "util/thread.h"
-#include "util/tick.h"
+
+struct sc_frame_keeper;
 
 /**
  * Clip buffer (doc/daemon.md §9.5): retain the ENCODED video stream so a
@@ -28,8 +29,8 @@
  * time without inventing or re-encoding frames. The live session and the
  * report recording are never touched.
  *
- * Clip times are relative to the first video packet (t = 0), the same origin
- * as the report recording and timeline.
+ * Clip times are relative to the first successfully retained decoded frame
+ * (t = 0), the same origin as the report recording and event timeline.
  */
 
 struct sc_clip_entry {
@@ -67,11 +68,9 @@ struct sc_clip_buffer {
     size_t count;
     size_t cap;
 
-    // Host clock anchored when the first encoded media packet is received.
-    // This shares t=0 with entries[0].pts, so report events, clip selection
-    // and static-screen elapsed time all use one timeline.
-    sc_tick first_packet_tick;
-    sc_tick session_end_tick;
+    // Not owned. Supplies the immutable (host tick, media PTS) anchor of the
+    // first successfully retained decoded frame.
+    struct sc_frame_keeper *timeline;
 
     bool opened;
     bool failed; // permanent for this device session; extract is untrusted
@@ -95,13 +94,15 @@ const struct sc_clip_format *
 sc_clip_format_for_codec(enum AVCodecID codec_id);
 
 bool
-sc_clip_buffer_init(struct sc_clip_buffer *cb);
+sc_clip_buffer_init(struct sc_clip_buffer *cb,
+                    struct sc_frame_keeper *timeline);
 
 void
 sc_clip_buffer_destroy(struct sc_clip_buffer *cb);
 
 /**
- * Last encoded packet timestamp in milliseconds relative to the first packet.
+ * Last encoded packet timestamp in milliseconds relative to the first decoded
+ * frame.
  * Unlike the session/report clock, this value may remain unchanged while the
  * screen is static. Returns false if no video packet has been received yet.
  */
@@ -110,8 +111,8 @@ sc_clip_buffer_source_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms);
 
 /**
  * Current real-time recording position, in milliseconds, anchored at the
- * first encoded packet (the same t=0 used by clip packet PTS). It continues
- * while the screen is static and freezes when the packet sink closes.
+ * first successfully retained decoded frame. It continues while the screen is
+ * static and freezes when the frame sink closes.
  */
 bool
 sc_clip_buffer_timeline_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms);
@@ -150,6 +151,13 @@ sc_clip_select_epoch(const struct sc_clip_entry *entries, size_t count,
 int64_t
 sc_clip_packet_duration_us(const struct sc_clip_entry *entries, size_t count,
                            size_t index, int64_t end_us);
+
+// Locate the exact encoded keyframe corresponding to the decoded-frame
+// timeline origin. Decoder preroll before it is permitted; a missing/non-key
+// origin is an invariant failure.
+int
+sc_clip_find_timeline_origin(const struct sc_clip_entry *entries, size_t count,
+                             int64_t origin, size_t *out_index);
 
 // Exact compatibility rule used to decide whether adjacent encoder epochs may
 // remain in one lossless-remuxed clip.

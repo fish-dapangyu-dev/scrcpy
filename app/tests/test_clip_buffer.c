@@ -59,6 +59,33 @@ test_packet_durations_hold_exact_end(void) {
 }
 
 static void
+test_decoded_frame_origin_is_exact(void) {
+    static const struct sc_clip_entry entries[] = {
+        {.pts = 1000, .key = true},  // decoder preroll
+        {.pts = 2000, .key = true},  // first retained decoded frame
+        {.pts = 3000, .key = false},
+    };
+    size_t index;
+    assert(sc_clip_find_timeline_origin(entries, ARRAY_LEN(entries), 2000,
+                                        &index) == 0);
+    assert(index == 1);
+
+    // The origin may never be rounded or snapped to a neighboring packet.
+    assert(sc_clip_find_timeline_origin(entries, ARRAY_LEN(entries), 2500,
+                                        &index) == SC_CLIP_EINTERNAL);
+    assert(sc_clip_find_timeline_origin(entries, ARRAY_LEN(entries), 4000,
+                                        &index) == SC_CLIP_ERANGE);
+
+    static const struct sc_clip_entry non_key_origin[] = {
+        {.pts = 1000, .key = true},
+        {.pts = 2000, .key = false},
+    };
+    assert(sc_clip_find_timeline_origin(non_key_origin,
+                                        ARRAY_LEN(non_key_origin), 2000,
+                                        &index) == SC_CLIP_EINTERNAL);
+}
+
+static void
 test_epoch_boundaries_are_exact(void) {
     static const struct sc_clip_entry entries[] = {
         {.pts = 0,    .epoch = 0, .key = true},
@@ -176,6 +203,7 @@ main(int argc, char *argv[]) {
     test_end_is_exclusive();
     test_start_snaps_to_keyframe();
     test_packet_durations_hold_exact_end();
+    test_decoded_frame_origin_is_exact();
     test_epoch_boundaries_are_exact();
     test_codec_compatible_container();
     test_epoch_compatibility_is_exact();

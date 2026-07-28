@@ -203,12 +203,18 @@ Protocol (all handled by the daemon, no client changes needed):
 1. A client invokes the command as usual
    (`--stream-report-render=true --stream-report-render.port=8001`).
 2. In `run` mode the script starts its background work (e.g. binds a port),
-   then **writes its result to `$SC_RESULT_FILE` to signal "ready"** and keeps
-   running (does *not* exit).
-3. The daemon waits until the result file is written (or the process exits),
-   returns that result to the client, and — if the process is **still alive** —
-   **adopts** it: the process is now owned by the daemon and lives until the
-   daemon stops.
+   then **writes a complete JSON object to `$SC_RESULT_FILE` to signal
+   "ready"** and keeps running (does *not* exit). Atomic replacement is
+   recommended. Merely creating the file, or exposing a
+   partially-written/invalid JSON document, does not count as ready; polling
+   continues in case a later read becomes valid.
+3. The daemon waits for a complete, valid result object, process exit, or the
+   ready deadline. It returns any valid result to the client and — if the
+   process is **still alive** — **adopts** it: the process is now owned by the
+   daemon and lives until the daemon stops. A still-running process may also
+   be adopted after the deadline so that it is not orphaned, but that call is
+   reported as `status:"ready_timeout"` rather than as a successful ready
+   handshake.
 
 The same service script can also do **one-shot** work in the same `run` mode
 (for example `--stream-report-render.export=./out`): just do the work, write
@@ -225,28 +231,52 @@ Up to `SC_MAX_SERVICES` (8) services may be adopted at once.
 
 ## Report integration and timestamps
 
-When `--auto-test-report` is active, the daemon logs a `plugin` start event
-the moment the add-on begins (so it always appears on the timeline, even
-without `--note`). The add-on's own screenshot / note / click steps are
-separate client requests, each logged **when it happens** — the report never
-waits for the whole operation to finish (see `DESIGN-test-report.md` §6). A
-typical AI operation therefore appears as:
+When `--auto-test-report` is active, each invocation produces exactly **one**
+completion event with `op:"plugin"`; there is no separate start event and no
+second `result` event. The event is written for success, non-zero exit, launch
+failure, missing result, and service-ready timeout alike. Its stable fields
+are:
 
-```
-… plugin (--prompt "Click Login")   ← operation starts
-… screencap                          ← add-on captured a frame
-… note   (analysis: found at 290,690)
-… control (click 290 690 100)        ← add-on clicked
-```
+| Field | Meaning |
+|---|---|
+| `name` | registered add-on command name |
+| `inputs` | primary command value plus every declared named input |
+| `assets` | report-relative copies of path/pathlist inputs |
+| `start_ms` | invocation start on the report timeline |
+| `t_ms` | invocation completion on that timeline |
+| `duration_ms` | `t_ms - start_ms`, measured by the daemon |
+| `wall` | wall-clock timestamp at completion (not at invocation start) |
+| `result` | the structured result object, or `null` when none was returned |
+| `status` | completion state (`ok`, an error state, or `ready_timeout`) |
+| `exit_code` | child exit code when known, otherwise `null` |
+| `service` | whether metadata declared `service=true` |
+| `adopted` | whether the still-running child was adopted by the daemon |
+| `active_duration_ms` | optional duration supplied by the add-on itself |
 
-The web report renders `plugin` events with a 🧩 marker.
+`duration_ms` is always the daemon-observed call duration. An add-on may
+return `active_duration_ms` when it can distinguish its own active work from
+queueing or setup, but that value never replaces the outer measurement.
+For a service, completion means valid ready JSON, process exit, or ready
+timeout; the measured duration intentionally does **not** cover the adopted
+process's remaining lifetime.
+
+The add-on's nested screenshot, note and control requests remain independent
+events at their own exact timestamps. Report renderers use `start_ms` and
+`t_ms` to show a duration interval for sufficiently long calls and only an
+end marker for short calls. Current renderers also normalize legacy reports
+that contain a start-only `plugin` event followed by a separate `result`
+event; new producers must emit the single completion form above.
 
 ## Lifecycle & security
 
-- The client call blocks until the add-on exits; the add-on runs on the
-  daemon, which sets the environment above.
-- On daemon shutdown (or `--daemon-stop`) a running add-on child is
-  terminated.
+- The client call blocks until a one-shot exits, or until a service reaches
+  valid ready JSON, exits, or reaches its ready timeout. The add-on runs on
+  the daemon, which sets the environment above.
+- On daemon shutdown, `--daemon-stop`, or loss of the device session, an
+  in-flight add-on child is terminated. The invocation is allowed to finish
+  its report bookkeeping, including its single completion event, before the
+  report is closed. Adopted service children are also terminated by the
+  daemon.
 - Add-ons are arbitrary shell that the daemon **operator** explicitly loads
   with `--add-on`; any local client of the daemon can then invoke a loaded
   add-on. This is the same localhost trust boundary as the rest of the daemon

@@ -19,8 +19,8 @@ struct sc_clip_buffer;
  * When the daemon runs with --auto-test-report=DIR, this module:
  *  - records the device screen to a codec-compatible container via
  *    sc_recorder (recording.mp4, or recording.webm for VP8),
- *  - appends every logged client operation to DIR/events.jsonl with a
- *    frame-accurate, drift-free timestamp derived from the video PTS clock,
+ *  - appends every logged client operation to DIR/events.jsonl on the common
+ *    timeline anchored by the first successfully retained decoded frame,
  *  - writes DIR/manifest.json at start and finalizes it on stop.
  *
  * Lifecycle: init() once at daemon start; start_recording()/stop_recording()
@@ -40,9 +40,10 @@ struct sc_report {
     struct sc_clip_buffer *timeline; // not owned; encoded-packet time origin
 
     struct sc_recorder recorder;
-    // Wrapper around recorder.video_packet_sink. It captures the exact
-    // session end before forwarding close(), so the recorder can extend a
-    // static final frame through the report timeline.
+    // Wrapper around recorder.video_packet_sink. Its close deliberately does
+    // not stop the recorder: packet sinks close before the daemon has drained
+    // final events and before the frame keeper clock is frozen. Report
+    // finalization publishes that later authoritative end, then stops it.
     struct sc_packet_sink video_packet_sink;
     bool recorder_initialized;
     bool recorder_started;
@@ -93,6 +94,15 @@ void
 sc_report_mark_failed(struct sc_report *report);
 
 /**
+ * Read the current position on the report's common timeline.
+ *
+ * Returns false until the first decoded frame has established the immutable
+ * timeline anchor. `out_ms` is never populated with a fabricated zero.
+ */
+bool
+sc_report_get_timeline_time_ms(struct sc_report *report, int64_t *out_ms);
+
+/**
  * Stop, join and destroy the recorder (finalizes the codec-compatible video
  * file), and write the final manifest. Safe to call once after
  * start_recording().
@@ -110,10 +120,30 @@ sc_report_stop_recording(struct sc_report *report);
  *   "\"video_size\":{\"w\":1080,\"h\":2400},\"cmds\":[\"click 1 2\"]"
  *
  * The common fields (seq, t_ms, wall, op, action) are added automatically.
- * The timestamp is the current video position (frame-accurate).
+ * The timestamp is sampled once from the common first-frame timeline.
+ *
+ * Returns false and writes nothing if the first-frame anchor does not exist,
+ * event acceptance has already closed, or persistence fails. A missing
+ * anchor or persistence failure also marks the report incomplete.
  */
-void
+bool
 sc_report_log_event(struct sc_report *report, const char *op,
                     const char *action, const char *extra_json);
+
+/**
+ * Append one operation at an already-sampled position on the common timeline.
+ *
+ * This lets a caller use one exact end point both for `t_ms` and for derived
+ * values such as `duration_ms`, without resampling between those fields.
+ * `t_ms` must be non-negative.
+ *
+ * Returns true only if the event was persisted. A negative timestamp or an
+ * I/O failure marks the report incomplete; a closed event gate simply rejects
+ * the late event.
+ */
+bool
+sc_report_log_event_at(struct sc_report *report, int64_t t_ms,
+                       const char *op, const char *action,
+                       const char *extra_json);
 
 #endif

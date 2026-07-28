@@ -60,10 +60,18 @@ struct sc_recorder {
     bool video_merges_late_config;
 
     // Optional exact end of the video timeline, relative to the first media
-    // packet. The report wrapper sets it when its packet sink closes so a
-    // static final screen is held through the real session end.
+    // packet. Report finalization sets it after the event gate has closed and
+    // the first-frame host clock has frozen, so a static final screen is held
+    // through the real session end.
     int64_t video_end_target_us;
     int64_t video_duration_us;
+
+    // Reports use the first successfully retained decoded frame as their
+    // immutable media origin. In explicit-origin mode, the worker queues but
+    // does not consume media packets until this value is published; the exact
+    // matching first retained packet must also be a keyframe.
+    bool video_pts_origin_required;
+    int64_t video_pts_origin_us;
 
     struct sc_recorder_stream video_stream;
     struct sc_recorder_stream audio_stream;
@@ -96,6 +104,14 @@ sc_recorder_stop(struct sc_recorder *recorder);
  */
 void
 sc_recorder_set_video_end(struct sc_recorder *recorder, int64_t end_us);
+
+/** Require and publish an explicit video PTS origin (both in microseconds). */
+void
+sc_recorder_require_video_pts_origin(struct sc_recorder *recorder);
+
+void
+sc_recorder_set_video_pts_origin(struct sc_recorder *recorder,
+                                 int64_t origin_us);
 
 void
 sc_recorder_join(struct sc_recorder *recorder);

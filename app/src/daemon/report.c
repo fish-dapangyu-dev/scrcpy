@@ -150,27 +150,49 @@ sc_report_video_packet_sink_open(
     return ok;
 }
 
+static bool
+sc_report_publish_video_origin(struct sc_report *report) {
+    int64_t origin;
+    if (!report->keeper
+            || !sc_frame_keeper_get_timeline_anchor(report->keeper, NULL,
+                                                     &origin)) {
+        return false;
+    }
+
+    sc_recorder_set_video_pts_origin(&report->recorder, origin);
+    return true;
+}
+
 static void
 sc_report_video_packet_sink_close(struct sc_packet_sink *sink) {
     struct sc_report *report = DOWNCAST_VIDEO(sink);
 
-    int64_t duration_ms = 0;
-    if (report->timeline) {
-        sc_clip_buffer_timeline_time_ms(report->timeline, &duration_ms);
+    if (!sc_report_publish_video_origin(report)) {
+        LOGE("Test report: video stream closed before the first decoded-frame "
+             "timeline anchor was established");
+        sc_report_mark_failed(report);
     }
-    // Setting even a zero target marks this as an exact report recording.
-    // This lets the recorder reject a config-only file with no media frame.
-    sc_recorder_set_video_end(&report->recorder, duration_ms * 1000);
 
-    struct sc_packet_sink *recorder_sink =
-        &report->recorder.video_packet_sink;
-    recorder_sink->ops->close(recorder_sink);
+    // Do not close the recorder here. Packet sinks are closed in reverse order:
+    // this wrapper closes before the decoder closes the frame keeper, and the
+    // daemon does not close the event gate until after all in-flight requests
+    // have drained. Stopping here could therefore finalize the video before the
+    // keeper clock freezes (or before the final event is persisted). The
+    // recorder has already received every encoded packet; report finalization
+    // below publishes the frozen end target, then stops and joins it.
 }
 
 static bool
 sc_report_video_packet_sink_push(struct sc_packet_sink *sink,
                                  const AVPacket *packet) {
     struct sc_report *report = DOWNCAST_VIDEO(sink);
+    if (packet->pts != AV_NOPTS_VALUE) {
+        // The decoded first frame may lag its encoded packet by several
+        // packets. Queue them all in the recorder, but publish the immutable
+        // decoded-frame media origin as soon as it becomes observable. The
+        // recorder worker waits for this value and drops decoder preroll.
+        sc_report_publish_video_origin(report);
+    }
     struct sc_packet_sink *recorder_sink =
         &report->recorder.video_packet_sink;
     bool ok = recorder_sink->ops->push(recorder_sink, packet);
@@ -368,6 +390,13 @@ sc_report_start_recording(struct sc_report *report, bool video,
     }
     report->recorder_initialized = true;
 
+    if (video) {
+        // Enable this before the worker starts. Encoded preroll may be queued,
+        // but it must not be consumed until the exact PTS of the first
+        // successfully retained decoded frame has been published.
+        sc_recorder_require_video_pts_origin(&report->recorder);
+    }
+
     if (!sc_recorder_start(&report->recorder)) {
         sc_recorder_destroy(&report->recorder);
         report->recorder_initialized = false;
@@ -393,6 +422,13 @@ sc_report_failed(struct sc_report *report) {
     return failed;
 }
 
+bool
+sc_report_get_timeline_time_ms(struct sc_report *report, int64_t *out_ms) {
+    assert(out_ms);
+    return report->keeper
+        && sc_frame_keeper_video_time_ms(report->keeper, out_ms);
+}
+
 void
 sc_report_stop_recording(struct sc_report *report) {
     // Serialize finalization with event writes. Once this gate closes, no
@@ -415,17 +451,32 @@ sc_report_stop_recording(struct sc_report *report) {
         }
     }
 
-    int width = report->keeper ? report->keeper->size.width : 0;
-    int height = report->keeper ? report->keeper->size.height : 0;
+    struct sc_size video_size = {0, 0};
+    if (report->keeper) {
+        // wait_size() also provides the synchronized size snapshot. If a
+        // frame already exists then it returns immediately; otherwise the
+        // current deadline makes this a non-blocking read.
+        sc_frame_keeper_wait_size(report->keeper, sc_tick_now(), &video_size);
+    }
 
     int64_t duration_ms = 0;
-    if (report->timeline) {
-        sc_clip_buffer_timeline_time_ms(report->timeline, &duration_ms);
+    bool has_anchor =
+        sc_report_get_timeline_time_ms(report, &duration_ms);
+    if (report->recorder_started && !sc_report_publish_video_origin(report)) {
+        has_anchor = false;
+    }
+    if (!has_anchor) {
+        LOGE("Test report: stopped before the first decoded-frame timeline "
+             "anchor was established");
+        sc_report_mark_failed(report);
     }
 
     if (report->recorder_started) {
-        // Fallback for an explicit report stop before the demuxer closes the
-        // wrapper sink. The wrapper normally captures the same value at EOS.
+        // The event gate is closed and the demuxer/frame keeper have stopped
+        // before normal session finalization reaches here. Publish the one
+        // authoritative frozen tail target before stopping the recorder so the
+        // final held frame covers every accepted event without moving any event
+        // coordinate.
         sc_recorder_set_video_end(&report->recorder, duration_ms * 1000);
         sc_recorder_stop(&report->recorder);
         sc_recorder_join(&report->recorder);
@@ -445,8 +496,8 @@ sc_report_stop_recording(struct sc_report *report) {
     char ended[32];
     iso8601_now(ended, sizeof(ended));
     bool failed = sc_report_failed(report);
-    if (!write_manifest(report, !failed, width, height, duration_ms, ended,
-                        event_count)) {
+    if (!write_manifest(report, !failed, video_size.width, video_size.height,
+                        duration_ms, ended, event_count)) {
         sc_mutex_lock(&report->mutex);
         report->io_failed = true;
         sc_mutex_unlock(&report->mutex);
@@ -457,12 +508,15 @@ sc_report_stop_recording(struct sc_report *report) {
          failed ? "recording failed" : "finalized", event_count, duration_ms);
 }
 
-void
-sc_report_log_event(struct sc_report *report, const char *op,
-                    const char *action, const char *extra_json) {
-    int64_t t_ms = 0;
-    if (report->timeline) {
-        sc_clip_buffer_timeline_time_ms(report->timeline, &t_ms);
+static bool
+sc_report_write_event_at(struct sc_report *report, int64_t t_ms,
+                         const char *op, const char *action,
+                         const char *extra_json) {
+    if (t_ms < 0) {
+        LOGE("Test report: refusing to log event with a negative timeline "
+             "timestamp");
+        sc_report_mark_failed(report);
+        return false;
     }
 
     char wall[32];
@@ -471,14 +525,14 @@ sc_report_log_event(struct sc_report *report, const char *op,
     struct sc_strbuf buf;
     if (!sc_strbuf_init(&buf, 256)) {
         sc_report_mark_failed(report);
-        return;
+        return false;
     }
 
     sc_mutex_lock(&report->mutex);
     if (!report->accepting_events) {
         sc_mutex_unlock(&report->mutex);
         free(buf.s);
-        return;
+        return false;
     }
     uint64_t seq = report->seq;
 
@@ -514,6 +568,43 @@ sc_report_log_event(struct sc_report *report, const char *op,
 
     sc_mutex_unlock(&report->mutex);
     free(buf.s);
+    return wrote;
+}
+
+bool
+sc_report_log_event_at(struct sc_report *report, int64_t t_ms,
+                       const char *op, const char *action,
+                       const char *extra_json) {
+    int64_t current_ms;
+    if (!sc_report_get_timeline_time_ms(report, &current_ms)) {
+        LOGE("Test report: refusing to log an event before the first decoded "
+             "frame established the timeline anchor");
+        sc_report_mark_failed(report);
+        return false;
+    }
+    if (t_ms > current_ms) {
+        LOGE("Test report: refusing to log an event in the future "
+             "(event=%" PRId64 "ms, current=%" PRId64 "ms)",
+             t_ms, current_ms);
+        sc_report_mark_failed(report);
+        return false;
+    }
+
+    return sc_report_write_event_at(report, t_ms, op, action, extra_json);
+}
+
+bool
+sc_report_log_event(struct sc_report *report, const char *op,
+                    const char *action, const char *extra_json) {
+    int64_t t_ms;
+    if (!sc_report_get_timeline_time_ms(report, &t_ms)) {
+        LOGE("Test report: refusing to log an event before the first decoded "
+             "frame established the timeline anchor");
+        sc_report_mark_failed(report);
+        return false;
+    }
+
+    return sc_report_write_event_at(report, t_ms, op, action, extra_json);
 }
 
 void

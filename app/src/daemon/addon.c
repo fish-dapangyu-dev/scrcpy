@@ -319,10 +319,18 @@ sc_addon_run(const char *path, const char *args, const char *const env[],
     argv[n++] = args ? args : "";
     argv[n] = NULL;
 
+    *pid = SC_PROCESS_NONE;
     enum sc_process_result pr =
         sc_process_execute((const char *const *) argv, pid, 0);
     free(argv);
     if (pr != SC_PROCESS_SUCCESS) {
+        // On Unix, fork may succeed before exec/fcntl reports an error through
+        // the internal pipe. Reap that already-created child instead of
+        // leaking a zombie on the start_failed path.
+        if (*pid != SC_PROCESS_NONE) {
+            sc_process_wait(*pid, true);
+            *pid = SC_PROCESS_NONE;
+        }
         LOGE("Add-on: could not run \"%s\"", path);
         return false;
     }

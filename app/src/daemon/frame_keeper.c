@@ -2,6 +2,8 @@
 
 #include <assert.h>
 
+#include <libavutil/avutil.h>
+
 #include "util/log.h"
 
 /** Downcast frame_sink to sc_frame_keeper */
@@ -44,6 +46,12 @@ sc_frame_keeper_frame_sink_push(struct sc_frame_sink *sink,
 
     sc_mutex_lock(&fk->mutex);
 
+    if (!fk->first_frame_tick && frame->pts == AV_NOPTS_VALUE) {
+        sc_mutex_unlock(&fk->mutex);
+        LOGE("Frame keeper: first decoded frame has no media PTS");
+        return false;
+    }
+
     // Use a temporary frame so that `latest` is preserved on error
     int r = av_frame_ref(fk->tmp, frame);
     if (r) {
@@ -60,7 +68,8 @@ sc_frame_keeper_frame_sink_push(struct sc_frame_sink *sink,
 
     sc_tick now = sc_tick_now();
     if (!fk->first_frame_tick) {
-        fk->first_frame_tick = now; // recording start reference (wall clock)
+        fk->first_frame_tick = now;
+        fk->first_frame_pts = frame->pts;
     }
     fk->last_frame_tick = now;
     fk->size.width = fk->latest->width;
@@ -109,6 +118,7 @@ sc_frame_keeper_init(struct sc_frame_keeper *fk) {
     fk->size.width = 0;
     fk->size.height = 0;
     fk->first_frame_tick = 0;
+    fk->first_frame_pts = AV_NOPTS_VALUE;
     fk->session_end_tick = 0;
     fk->opened = false;
 
@@ -187,6 +197,7 @@ sc_frame_keeper_reset(struct sc_frame_keeper *fk) {
     fk->size.width = 0;
     fk->size.height = 0;
     fk->first_frame_tick = 0;
+    fk->first_frame_pts = AV_NOPTS_VALUE;
     fk->session_end_tick = 0;
     sc_mutex_unlock(&fk->mutex);
 }
@@ -204,6 +215,24 @@ sc_frame_keeper_video_time_ms(struct sc_frame_keeper *fk, int64_t *out_ms) {
         *out_ms = SC_TICK_TO_MS(end - fk->first_frame_tick);
         if (*out_ms < 0) {
             *out_ms = 0;
+        }
+    }
+    sc_mutex_unlock(&fk->mutex);
+    return ok;
+}
+
+bool
+sc_frame_keeper_get_timeline_anchor(struct sc_frame_keeper *fk,
+                                    sc_tick *out_tick, int64_t *out_pts) {
+    sc_mutex_lock(&fk->mutex);
+    bool ok = fk->first_frame_tick != 0
+           && fk->first_frame_pts != AV_NOPTS_VALUE;
+    if (ok) {
+        if (out_tick) {
+            *out_tick = fk->first_frame_tick;
+        }
+        if (out_pts) {
+            *out_pts = fk->first_frame_pts;
         }
     }
     sc_mutex_unlock(&fk->mutex);

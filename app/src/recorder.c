@@ -315,15 +315,22 @@ sc_recorder_process_packets(struct sc_recorder *recorder) {
         sc_mutex_lock(&recorder->mutex);
 
         while (!recorder->stopped) {
-            if (recorder->video && !video_pkt &&
-                    !sc_vecdeque_is_empty(&recorder->video_queue)) {
-                // A new packet may be assigned to video_pkt and be processed
-                break;
-            }
-            if (recorder->audio && !audio_pkt
-                    && !sc_vecdeque_is_empty(&recorder->audio_queue)) {
-                // A new packet may be assigned to audio_pkt and be processed
-                break;
+            bool waiting_for_origin =
+                recorder->video_pts_origin_required
+                && recorder->video_pts_origin_us == AV_NOPTS_VALUE;
+            if (!waiting_for_origin) {
+                if (recorder->video && !video_pkt
+                        && !sc_vecdeque_is_empty(&recorder->video_queue)) {
+                    // A new packet may be assigned to video_pkt and be
+                    // processed
+                    break;
+                }
+                if (recorder->audio && !audio_pkt
+                        && !sc_vecdeque_is_empty(&recorder->audio_queue)) {
+                    // A new packet may be assigned to audio_pkt and be
+                    // processed
+                    break;
+                }
             }
             sc_cond_wait(&recorder->cond, &recorder->mutex);
         }
@@ -356,6 +363,16 @@ sc_recorder_process_packets(struct sc_recorder *recorder) {
             break;
         }
 
+        if (recorder->video_pts_origin_required
+                && recorder->video_pts_origin_us == AV_NOPTS_VALUE) {
+            sc_mutex_unlock(&recorder->mutex);
+            LOGE("Recording stopped before the decoded-frame origin was set");
+            error = true;
+            break;
+        }
+
+        int64_t forced_video_origin = recorder->video_pts_origin_us;
+
         assert(video_pkt || audio_pkt); // at least one
 
         sc_mutex_unlock(&recorder->mutex);
@@ -387,8 +404,36 @@ sc_recorder_process_packets(struct sc_recorder *recorder) {
             continue;
         }
 
+        if (video_pkt && forced_video_origin != AV_NOPTS_VALUE
+                && video_pkt->pts < forced_video_origin) {
+            // Decoder preroll before the first visible frame is not part of
+            // the report timeline.
+            av_packet_free(&video_pkt);
+            continue;
+        }
+
         if (pts_origin == AV_NOPTS_VALUE) {
-            if (!recorder->audio && video_pkt) {
+            if (forced_video_origin != AV_NOPTS_VALUE && video_pkt) {
+                if (video_pkt->pts != forced_video_origin) {
+                    LOGE("First report packet PTS (%" PRId64
+                         ") does not match first decoded-frame PTS (%" PRId64
+                         ")", video_pkt->pts, forced_video_origin);
+                    error = true;
+                    goto end;
+                }
+                if (!(video_pkt->flags & AV_PKT_FLAG_KEY)) {
+                    // A rare failure to retain the decoder's initial frame
+                    // could otherwise move the chosen origin to a delta frame.
+                    // Keeping pre-origin media would invent negative report
+                    // time, while starting from that delta would produce a
+                    // report which is not independently decodable.
+                    LOGE("First report packet at the decoded-frame origin is "
+                         "not a keyframe");
+                    error = true;
+                    goto end;
+                }
+                pts_origin = forced_video_origin;
+            } else if (!recorder->audio && video_pkt) {
                 pts_origin = video_pkt->pts;
             } else if (!recorder->video && audio_pkt) {
                 pts_origin = audio_pkt->pts;
@@ -861,6 +906,8 @@ sc_recorder_init(struct sc_recorder *recorder, const char *filename,
     recorder->video_merges_late_config = false;
     recorder->video_end_target_us = AV_NOPTS_VALUE;
     recorder->video_duration_us = 0;
+    recorder->video_pts_origin_required = false;
+    recorder->video_pts_origin_us = AV_NOPTS_VALUE;
 
     sc_recorder_stream_init(&recorder->video_stream);
     sc_recorder_stream_init(&recorder->audio_stream);
@@ -937,6 +984,27 @@ sc_recorder_set_video_end(struct sc_recorder *recorder, int64_t end_us) {
     if (recorder->video_end_target_us == AV_NOPTS_VALUE
             || end_us > recorder->video_end_target_us) {
         recorder->video_end_target_us = end_us;
+    }
+    sc_mutex_unlock(&recorder->mutex);
+}
+
+void
+sc_recorder_require_video_pts_origin(struct sc_recorder *recorder) {
+    sc_mutex_lock(&recorder->mutex);
+    recorder->video_pts_origin_required = true;
+    sc_mutex_unlock(&recorder->mutex);
+}
+
+void
+sc_recorder_set_video_pts_origin(struct sc_recorder *recorder,
+                                 int64_t origin_us) {
+    assert(origin_us != AV_NOPTS_VALUE);
+    sc_mutex_lock(&recorder->mutex);
+    if (recorder->video_pts_origin_us == AV_NOPTS_VALUE) {
+        recorder->video_pts_origin_us = origin_us;
+        sc_cond_signal(&recorder->cond);
+    } else {
+        assert(recorder->video_pts_origin_us == origin_us);
     }
     sc_mutex_unlock(&recorder->mutex);
 }
