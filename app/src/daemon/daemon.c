@@ -845,8 +845,9 @@ video_codec_name(enum sc_codec codec) {
 }
 
 // Append ",\"report\":{...}" (the --auto-test-report location and recording
-// state) and ",\"config\":{...}" (the referenced capture parameters), so
-// --daemon-status is a one-stop readout of how the daemon was launched.
+// state and timeline clocks) and ",\"config\":{...}" (the referenced capture
+// parameters), so --daemon-status is a one-stop readout of how the daemon was
+// launched.
 static bool
 append_status_extras(struct sc_daemon *d, struct sc_strbuf *buf) {
     const struct scrcpy_options *o = d->opts;
@@ -858,11 +859,25 @@ append_status_extras(struct sc_daemon *d, struct sc_strbuf *buf) {
           && sc_strbuf_append_str(buf,
                  o->auto_test_report ? "true" : "false");
     if (w && o->auto_test_report) {
+        int64_t recorded_ms = 0;
+        int64_t source_end_ms = 0;
+        sc_frame_keeper_video_time_ms(&d->keeper, &recorded_ms);
+        sc_clip_buffer_source_time_ms(&d->clips, &source_end_ms);
+        int64_t held_tail_ms = recorded_ms > source_end_ms
+                             ? recorded_ms - source_end_ms : 0;
+        char timeline[160];
+        snprintf(timeline, sizeof(timeline),
+                 ",\"recorded_ms\":%" PRId64
+                 ",\"source_end_ms\":%" PRId64
+                 ",\"held_tail_ms\":%" PRId64,
+                 recorded_ms, source_end_ms, held_tail_ms);
+
         w = sc_strbuf_append_staticstr(buf, ",\"dir\":")
          && sc_json_append_escaped(buf, o->auto_test_report)
          && sc_strbuf_append_staticstr(buf, ",\"recording\":")
          && sc_strbuf_append_str(buf,
-                d->report_recording ? "true" : "false");
+                d->report_recording ? "true" : "false")
+         && sc_strbuf_append_str(buf, timeline);
         if (w && d->report_initialized && d->report.video_path) {
             w = sc_strbuf_append_staticstr(buf, ",\"video\":")
              && sc_json_append_escaped(buf, d->report.video_path);
@@ -1033,8 +1048,9 @@ handle_screencap(struct sc_daemon *d, sc_socket socket, int64_t id,
 // Extract [start_ms, end_ms] of the current recording as a standalone MP4
 // (doc/daemon.md §9.5). The clip bytes are returned as the response payload;
 // the CLIENT writes the output file, so this also works remotely and needs no
-// daemon-side write access. The start snaps back to the nearest keyframe; a
-// not-yet-recorded end is an E_RANGE error (contract of --clip-start/end).
+// daemon-side write access. The start snaps back to the nearest keyframe.
+// Availability is checked against the report/session wall clock, not the last
+// packet PTS: Android may emit no encoded packet while a frame stays static.
 static void
 handle_clip(struct sc_daemon *d, sc_socket socket, int64_t id,
             struct sc_json *json) {
@@ -1052,24 +1068,40 @@ handle_clip(struct sc_daemon *d, sc_socket socket, int64_t id,
         return;
     }
 
+    if (!acquire_session(d, socket, id)) {
+        return;
+    }
+
+    int64_t recorded_ms;
+    if (!sc_frame_keeper_video_time_ms(&d->keeper, &recorded_ms)) {
+        release_session(d);
+        send_error(socket, id, "E_RANGE", "no video has been recorded yet");
+        return;
+    }
+
     uint8_t *mp4;
     size_t mp4_size;
-    int64_t actual_start_ms, actual_end_ms;
+    int64_t actual_start_ms, actual_end_ms, source_end_ms, held_tail_ms;
     char err[192];
-    int r = sc_clip_buffer_extract(&d->clips, start_ms, end_ms, &mp4,
-                                   &mp4_size, &actual_start_ms,
-                                   &actual_end_ms, err, sizeof(err));
+    int r = sc_clip_buffer_extract(&d->clips, start_ms, end_ms, recorded_ms,
+                                   &mp4, &mp4_size, &actual_start_ms,
+                                   &actual_end_ms, &source_end_ms,
+                                   &held_tail_ms, err, sizeof(err));
+    release_session(d);
     if (r) {
         send_error(socket, id,
                    r == SC_CLIP_ERANGE ? "E_RANGE" : "E_INTERNAL", err);
         return;
     }
 
-    char extra[128];
+    char extra[256];
     snprintf(extra, sizeof(extra),
              "\"start_ms\":%" PRId64 ",\"end_ms\":%" PRId64
+             ",\"source_end_ms\":%" PRId64
+             ",\"held_tail_ms\":%" PRId64
              ",\"payload_len\":%zu",
-             actual_start_ms, actual_end_ms, mp4_size);
+             actual_start_ms, actual_end_ms, source_end_ms, held_tail_ms,
+             mp4_size);
     send_ok(socket, id, extra, mp4, mp4_size);
     av_free(mp4);
 }
@@ -1124,7 +1156,7 @@ handle_control(struct sc_daemon *d, sc_socket socket, int64_t id,
 
     // Each connection thread executes one request at a time, so deriving the
     // range from the connection slot guarantees concurrent requests use
-    // disjoint pointer ids (doc/daemon.md §9.5): at most
+    // disjoint pointer ids (doc/daemon.md §9.6): at most
     // 1 + 16*100 + 99 = 1700, far below the reserved values
     // (SC_POINTER_ID_MOUSE, ...) at the top of the uint64 range
     uint64_t pointer_base = 1 + (uint64_t) conn_index * SC_MAX_CONTROL_CMDS;

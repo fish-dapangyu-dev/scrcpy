@@ -86,6 +86,19 @@ sc_clip_buffer_destroy(struct sc_clip_buffer *cb) {
     sc_mutex_destroy(&cb->mutex);
 }
 
+bool
+sc_clip_buffer_source_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms) {
+    sc_mutex_lock(&cb->mutex);
+    bool ok = cb->count != 0;
+    if (ok) {
+        int64_t first = cb->entries[0].pts;
+        int64_t last = cb->entries[cb->count - 1].pts;
+        *out_ms = (last - first) / 1000;
+    }
+    sc_mutex_unlock(&cb->mutex);
+    return ok;
+}
+
 // ---- packet sink trait ------------------------------------------------------
 
 static bool
@@ -199,14 +212,32 @@ last_at_or_before(const struct sc_clip_entry *entries, size_t count,
     return res;
 }
 
+// Binary search: index of the last entry with pts < t, or -1 if none.
+static ssize_t
+last_before(const struct sc_clip_entry *entries, size_t count, int64_t t) {
+    ssize_t lo = 0, hi = (ssize_t) count - 1, res = -1;
+    while (lo <= hi) {
+        ssize_t mid = lo + (hi - lo) / 2;
+        if (entries[mid].pts < t) {
+            res = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return res;
+}
+
 bool
 sc_clip_select(const struct sc_clip_entry *entries, size_t count,
                int64_t start_us, int64_t end_us, size_t *begin, size_t *stop) {
-    if (!count || start_us > end_us) {
+    if (!count || start_us >= end_us) {
         return false;
     }
 
-    ssize_t last = last_at_or_before(entries, count, end_us);
+    // `end_us` is an exclusive playback boundary. A packet stamped exactly
+    // at the boundary belongs to the following segment.
+    ssize_t last = last_before(entries, count, end_us);
     if (last < 0) {
         return false; // the window ends before the first packet
     }
@@ -238,10 +269,26 @@ sc_clip_select(const struct sc_clip_entry *entries, size_t count,
 
 // ---- extraction -------------------------------------------------------------
 
+static int64_t
+packet_duration_us(const struct sc_clip_entry *entries, size_t count,
+                   size_t index, int64_t end_us) {
+    assert(count && index < count);
+    int64_t packet_end = index + 1 < count ? entries[index + 1].pts : end_us;
+    return packet_end - entries[index].pts;
+}
+
+#ifdef SC_TEST
+int64_t
+sc_clip_packet_duration_us(const struct sc_clip_entry *entries, size_t count,
+                           size_t index, int64_t end_us) {
+    return packet_duration_us(entries, count, index, end_us);
+}
+#endif
+
 static int
 mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
             size_t count, const uint8_t *config, size_t config_size,
-            uint8_t **out, size_t *out_size) {
+            int64_t end_us, uint8_t **out, size_t *out_size) {
     int ret = SC_CLIP_EINTERNAL;
     AVFormatContext *ctx = NULL;
     AVPacket *packet = NULL;
@@ -300,6 +347,15 @@ mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
         }
         packet->pts = e->pts - base;
         packet->dts = packet->pts;
+        int64_t duration = packet_duration_us(entries, count, i, end_us);
+        if (duration <= 0) {
+            av_packet_unref(packet);
+            goto end;
+        }
+        // Keep every source PTS intact. On a static screen there may be no
+        // later encoded packet, so the final sample itself must carry the
+        // elapsed time through the requested clip boundary.
+        packet->duration = duration;
         packet->flags = e->key ? AV_PKT_FLAG_KEY : 0;
         packet->stream_index = 0;
         av_packet_rescale_ts(packet, SCRCPY_TIME_BASE, stream->time_base);
@@ -342,8 +398,10 @@ end:
 
 int
 sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
-                       int64_t end_ms, uint8_t **out, size_t *out_size,
+                       int64_t end_ms, int64_t available_end_ms,
+                       uint8_t **out, size_t *out_size,
                        int64_t *actual_start_ms, int64_t *actual_end_ms,
+                       int64_t *source_end_ms, int64_t *held_tail_ms,
                        char *errbuf, size_t errbuf_size) {
     assert(start_ms >= 0 && end_ms > start_ms);
 
@@ -356,19 +414,18 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
     }
 
     int64_t first = cb->entries[0].pts;
-    int64_t last = cb->entries[cb->count - 1].pts;
-    int64_t start_us = first + start_ms * 1000;
-    int64_t end_us = first + end_ms * 1000;
-
-    if (end_us > last) {
+    if (end_ms > available_end_ms) {
         snprintf(errbuf, errbuf_size,
                  "clip end %" PRId64 ".%03" PRId64 "s is beyond the recorded "
-                 "%" PRId64 ".%03" PRId64 "s",
+                 "%" PRId64 ".%03" PRId64 "s timeline",
                  end_ms / 1000, end_ms % 1000,
-                 (last - first) / 1000000, ((last - first) / 1000) % 1000);
+                 available_end_ms / 1000, available_end_ms % 1000);
         sc_mutex_unlock(&cb->mutex);
         return SC_CLIP_ERANGE;
     }
+
+    int64_t start_us = first + start_ms * 1000;
+    int64_t end_us = first + end_ms * 1000;
 
     size_t begin, stop;
     if (!sc_clip_select(cb->entries, cb->count, start_us, end_us,
@@ -402,15 +459,17 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
     }
     sc_mutex_unlock(&cb->mutex);
 
-    int ret = mux_entries(cb, slice, n, config, config_size, out, out_size);
+    int ret = mux_entries(cb, slice, n, config, config_size, end_us, out,
+                          out_size);
     if (ret) {
         snprintf(errbuf, errbuf_size, "could not mux the clip");
     } else {
         *actual_start_ms = (slice[0].pts - first) / 1000;
-        *actual_end_ms = (slice[n - 1].pts - first) / 1000;
+        *actual_end_ms = end_ms;
+        *source_end_ms = (slice[n - 1].pts - first) / 1000;
+        *held_tail_ms = end_ms - *source_end_ms;
     }
     free(slice);
     free(config);
     return ret;
 }
-

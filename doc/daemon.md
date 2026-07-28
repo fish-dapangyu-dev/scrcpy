@@ -18,7 +18,7 @@ Implementation notes (deviations from the original proposal):
    (`app/src/daemon/frame_keeper.c`).
  - Client exit code 2 reuses `SCRCPY_EXIT_DISCONNECTED`.
  - The clipboard-injection mutex serializes whole `control` requests that
-   contain an `input` step (coarser than §9.5, same guarantee).
+   contain an `input` step (coarser than §9.6, same guarantee).
  - Touch pointer-id ranges are derived from the connection slot index
    (disjoint by construction) instead of a wrapping allocator.
  - Control step durations (`click`/`swipe` duration, `sleep`) are capped at
@@ -408,7 +408,7 @@ allowing pipelining (v1 clients send sequentially, the field future-proofs).
 | `op` | Params | Success response extras |
 |---|---|---|
 | `ping` | — | — |
-| `status` | — | `protocol`, `app`, `version`, `state`, `serial`, `device_name`, `uptime_ms`, `last_frame_age_ms`, `plugins` (same advertised schema array as the hello), `report` (`enabled`, and when enabled `dir` / `recording` / `video` = the `recording.mp4` path), `config` (the referenced capture params: `port`, `control`, `video`, and when video is on `codec` / `bit_rate` / `max_size` / `max_fps` / `encoder`) |
+| `status` | — | `protocol`, `app`, `version`, `state`, `serial`, `device_name`, `uptime_ms`, `last_frame_age_ms`, `plugins` (same advertised schema array as the hello), `report` (`enabled`, and when enabled `dir` / `recording` / `video` = the `recording.mp4` path, `recorded_ms` = wall-elapsed report time, `source_end_ms` = last encoded-packet PTS, `held_tail_ms` = their current static-frame gap), `config` (the referenced capture params: `port`, `control`, `video`, and when video is on `codec` / `bit_rate` / `max_size` / `max_fps` / `encoder`) |
 | `screencap` | `format` (`"png"`, only value in v1), `max_age_ms` (optional, §9.4) | `width`, `height`, `payload_len` + PNG bytes as payload |
 | `control` | `cmds`: array of strings — each string one `--control` argument, same mini-language and same parallel/`&&` semantics as the CLI (`sc_control_exec_run`, `app/src/control_exec.c`) | — (returns after execution completes, like the CLI does) |
 | `inject_touch` | `action` (`down`/`up`/`move`), `x`, `y` (video-pixel space), optional `pointer_id`, `buttons` | — (non-blocking; enqueues one touch event) |
@@ -418,7 +418,7 @@ allowing pipelining (v1 clients send sequentially, the field future-proofs).
 | `note` | `note`: a `"title: description"` annotation | — (logged to the test report as a `note` event with `title`/`text`; standalone, not tied to any control command) |
 | `plugin` | `name`, `args`, optional `arg_names`/`arg_values` (parallel string arrays of the declared extra arguments) | runs the loaded add-on registered for `name` with `args` as `$1`, each extra argument exported as `SC_ARG_<NAME>`, and a `SC_RESULT_FILE` temp path (doc/addons.md); blocks until the script exits; auto-logs a `plugin` report event; returns `result` (the JSON the script wrote to `SC_RESULT_FILE`, if any) |
 | `upload` | `name` (a basename), `payload_len` + that many raw payload bytes after the JSON frame | stores the payload in a per-connection temp file (removed on disconnect) and returns its daemon-side `path`; used to ship a `path`/`pathlist` argument's bytes when the client (or web server) is remote |
-| `clip` | `start_ms`, `end_ms` (ms since the first video packet, `0 <= start < end`) | `start_ms`, `end_ms` (ACTUAL clip bounds: the start snaps back to the keyframe at or before the requested start), `payload_len` + a standalone MP4 as payload. The daemon spools every encoded packet of the current stream session (`app/src/daemon/clip_buffer.c`, a demuxer sink independent of the recorder) and muxes the selected range in memory with timestamps rebased to 0; the CLIENT writes the file, so remote clients work and the daemon needs no write access. An `end_ms` beyond the last recorded packet is an `E_RANGE` error. |
+| `clip` | `start_ms`, `end_ms` (ms on the report/session timeline, `0 <= start < end`) | `start_ms`, `end_ms` (actual clip bounds: start snaps back to a keyframe; end stays exact), `source_end_ms` (last included encoded-packet PTS), `held_tail_ms` (final sample hold), `payload_len` + a standalone MP4 as payload. The daemon spools every encoded packet of the current stream session (`app/src/daemon/clip_buffer.c`, a demuxer sink independent of the recorder) and muxes the selected range in memory with timestamps rebased to 0; the CLIENT writes the file, so remote clients work and the daemon needs no write access. An `end_ms` beyond the wall-elapsed session position is an `E_RANGE` error. |
 | `subscribe_video` | — | turns the connection into a one-way encoded-video push stream (see §8.7); no `ok` reply — the first `video_meta` event is the ack |
 | `shutdown` | — | — (daemon exits after responding) |
 
@@ -594,7 +594,31 @@ latest frame already equals the current screen except during the tiny window
 of an in-flight change. `RESET_VIDEO` is the escape hatch, not the norm — it
 restarts the encoder, costing ~100–300 ms.
 
-### 9.5 Control command execution
+### 9.5 Clip extraction and static-frame time
+
+The clip spool stores encoded packets and their original PTS. Packet PTS is
+not an availability clock: Android MediaCodec may emit nothing for many
+seconds while the display is static. The report/event clock therefore uses
+wall elapsed time since the first decoded frame, and `clip.end_ms` is checked
+only against that session clock.
+
+Extraction selects packets in the half-open range `[start_ms, end_ms)`,
+snapping the start back to a decodable keyframe. Every selected packet keeps
+its original relative PTS. Packet durations are the distance to the next PTS;
+the last sample duration is extended exactly to `end_ms`. Consequently a
+static tail displays the real last frame for the missing interval without
+moving events, compressing time, fabricating frames, or re-encoding video.
+The response separates:
+
+- `end_ms`: the exact requested/report end;
+- `source_end_ms`: the last included encoded packet position;
+- `held_tail_ms`: `end_ms - source_end_ms`.
+
+The session clock freezes when the frame sink closes. A request beyond that
+frozen position returns `E_RANGE`; small process-termination corrections are
+an upper-layer policy and the daemon never silently truncates a Case.
+
+### 9.6 Control command execution
 
 The `feat/control` executor is reused with two changes:
 
@@ -739,7 +763,7 @@ warning if the registry already holds a live entry for its serial.
    uses 1. If the window restriction is ever lifted, bump the constant
    (trivial, array-sized).
 4. **Concurrent `control` requests** — pointer-id ranges + clipboard mutex
-   (§9.5). Additionally the *screen-size denominator*: injected coordinates
+   (§9.6). Additionally the *screen-size denominator*: injected coordinates
    are normalized against `UINT16_MAX` pseudo-size by the `feat/control`
    executor, which the server maps to the current stream size — rotation
    mid-gesture still lands wrong (already true today; documented, not

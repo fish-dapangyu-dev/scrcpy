@@ -209,6 +209,8 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
     int64_t payload_len = 0;
     int64_t start_ms = 0;
     int64_t end_ms = 0;
+    int64_t source_end_ms = 0;
+    int64_t held_tail_ms = 0;
     if (ok && (!sc_json_get_int64(&json, "payload_len", &payload_len)
                    || payload_len <= 0)) {
         LOGE("Client: missing clip payload");
@@ -217,6 +219,8 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
     if (ok) {
         sc_json_get_int64(&json, "start_ms", &start_ms);
         sc_json_get_int64(&json, "end_ms", &end_ms);
+        sc_json_get_int64(&json, "source_end_ms", &source_end_ms);
+        sc_json_get_int64(&json, "held_tail_ms", &held_tail_ms);
     } else if (opts->json) {
         char *err = sc_json_get_raw(&json, "error");
         printf("{\"error\":%s}\n", err ? err : "{\"code\":\"E_CLIP\","
@@ -251,11 +255,14 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
     if (opts->json) {
         struct sc_strbuf out;
         if (sc_strbuf_init(&out, 128)) {
-            char tail[96];
+            char tail[192];
             snprintf(tail, sizeof(tail),
                      ",\"start_ms\":%" PRId64 ",\"end_ms\":%" PRId64
+                     ",\"source_end_ms\":%" PRId64
+                     ",\"held_tail_ms\":%" PRId64
                      ",\"bytes\":%" PRId64 "}",
-                     start_ms, end_ms, payload_len);
+                     start_ms, end_ms, source_end_ms, held_tail_ms,
+                     payload_len);
             if (sc_strbuf_append_staticstr(&out, "{\"file\":")
                     && sc_json_append_escaped(&out, opts->clip_output)
                     && sc_strbuf_append_str(&out, tail)) {
@@ -266,9 +273,12 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
         }
     } else {
         LOGI("Clip saved to %s (%" PRId64 ".%03" PRId64 "s - %" PRId64
-             ".%03" PRId64 "s, %" PRId64 " bytes)",
+             ".%03" PRId64 "s, source end %" PRId64 ".%03" PRId64
+             "s, held tail %" PRId64 " ms, %" PRId64 " bytes)",
              opts->clip_output, start_ms / 1000, start_ms % 1000,
-             end_ms / 1000, end_ms % 1000, payload_len);
+             end_ms / 1000, end_ms % 1000,
+             source_end_ms / 1000, source_end_ms % 1000,
+             held_tail_ms, payload_len);
     }
     ok = true;
 

@@ -33,6 +33,9 @@ struct sc_frame_keeper {
     // real time (static screens hold a frame), whereas the encoder emits
     // frames only on change, so frame PTS would freeze during static periods.
     sc_tick first_frame_tick;
+    // Freeze the session clock when the sink closes. Without this, a stopped
+    // session would appear to keep recording while its report is finalized.
+    sc_tick session_end_tick;
     bool opened;
 };
 
@@ -78,8 +81,10 @@ void
 sc_frame_keeper_reset(struct sc_frame_keeper *fk);
 
 /**
- * Current position in the recording, in milliseconds, derived from the video
- * PTS clock (frame-accurate, drift-free). Returns false if no frame yet.
+ * Current position in the recording timeline, in milliseconds. The clock is
+ * wall elapsed since the first decoded frame, because an Android encoder may
+ * emit no packets while the screen is static. It freezes when the frame sink
+ * closes. Returns false if no frame has been received yet.
  */
 bool
 sc_frame_keeper_video_time_ms(struct sc_frame_keeper *fk, int64_t *out_ms);

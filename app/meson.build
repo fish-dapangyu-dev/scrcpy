@@ -263,6 +263,13 @@ if get_option('buildtype') == 'debug'
             'src/util/strbuf.c',
             'src/util/term.c',
         ]],
+        ['test_clip_buffer', [
+            'tests/test_clip_buffer.c',
+            'src/daemon/clip_buffer.c',
+            'src/util/log.c',
+            'src/util/thread.c',
+            'src/util/tick.c',
+        ]],
         ['test_command_windows', [
           'tests/test_command_windows.c',
           'src/util/command.c',

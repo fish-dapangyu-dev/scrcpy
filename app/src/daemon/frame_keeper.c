@@ -17,6 +17,7 @@ sc_frame_keeper_frame_sink_open(struct sc_frame_sink *sink,
 
     sc_mutex_lock(&fk->mutex);
     fk->opened = true;
+    fk->session_end_tick = 0;
     sc_cond_broadcast(&fk->cond);
     sc_mutex_unlock(&fk->mutex);
 
@@ -28,6 +29,9 @@ sc_frame_keeper_frame_sink_close(struct sc_frame_sink *sink) {
     struct sc_frame_keeper *fk = DOWNCAST(sink);
 
     sc_mutex_lock(&fk->mutex);
+    if (fk->first_frame_tick && !fk->session_end_tick) {
+        fk->session_end_tick = sc_tick_now();
+    }
     fk->opened = false;
     sc_cond_broadcast(&fk->cond);
     sc_mutex_unlock(&fk->mutex);
@@ -105,6 +109,7 @@ sc_frame_keeper_init(struct sc_frame_keeper *fk) {
     fk->size.width = 0;
     fk->size.height = 0;
     fk->first_frame_tick = 0;
+    fk->session_end_tick = 0;
     fk->opened = false;
 
     static const struct sc_frame_sink_ops ops = {
@@ -182,6 +187,7 @@ sc_frame_keeper_reset(struct sc_frame_keeper *fk) {
     fk->size.width = 0;
     fk->size.height = 0;
     fk->first_frame_tick = 0;
+    fk->session_end_tick = 0;
     sc_mutex_unlock(&fk->mutex);
 }
 
@@ -193,7 +199,9 @@ sc_frame_keeper_video_time_ms(struct sc_frame_keeper *fk, int64_t *out_ms) {
         // Wall-clock elapsed since the first frame = the position in the
         // real-time mp4 playback timeline. (Frame PTS would freeze while the
         // screen is static, since the encoder only emits frames on change.)
-        *out_ms = SC_TICK_TO_MS(sc_tick_now() - fk->first_frame_tick);
+        sc_tick end = fk->session_end_tick ? fk->session_end_tick
+                                           : sc_tick_now();
+        *out_ms = SC_TICK_TO_MS(end - fk->first_frame_tick);
         if (*out_ms < 0) {
             *out_ms = 0;
         }
