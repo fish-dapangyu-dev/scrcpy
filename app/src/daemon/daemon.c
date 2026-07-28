@@ -360,6 +360,8 @@ sc_daemon_session_start(struct sc_daemon *d) {
         .vd_system_decorations = options->vd_system_decorations,
         .keep_active = options->keep_active,
         .flex_display = false,
+        .ignore_video_encoder_constraints =
+            options->ignore_video_encoder_constraints,
         .list = 0,
     };
 

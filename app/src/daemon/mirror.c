@@ -11,7 +11,6 @@
 #include "control_msg.h"
 #include "controller.h"
 #include "decoder.h"
-#include "delay_buffer.h"
 #include "demuxer.h"
 #include "events.h"
 #include "keyboard_sdk.h"
@@ -25,6 +24,7 @@
 #include "util/strbuf.h"
 #include "util/thread.h"
 #include "util/tick.h"
+#include "video_regulator.h"
 
 // Demuxer wire format constants (app/src/demuxer.c; the adapter thread
 // produces this format so the stock demuxer consumes the daemon stream)
@@ -665,7 +665,7 @@ sc_mirror_run(const struct scrcpy_options *options) {
 
     static struct sc_demuxer demuxer;
     static struct sc_decoder decoder;
-    static struct sc_delay_buffer video_buffer;
+    static struct sc_video_regulator video_regulator;
     static struct sc_controller controller;
     static struct sc_keyboard_sdk keyboard_sdk;
     static struct sc_mouse_sdk mouse_sdk;
@@ -819,9 +819,9 @@ sc_mirror_run(const struct scrcpy_options *options) {
 
     struct sc_frame_source *src = &decoder.frame_source;
     if (options->video_buffer) {
-        sc_delay_buffer_init(&video_buffer, options->video_buffer, true);
-        sc_frame_source_add_sink(src, &video_buffer.frame_sink);
-        src = &video_buffer.frame_source;
+        sc_video_regulator_init(&video_regulator, options->video_buffer, true);
+        sc_frame_source_add_sink(src, &video_regulator.frame_sink);
+        src = &video_regulator.frame_source;
     }
     sc_frame_source_add_sink(src, &screen.frame_sink);
 

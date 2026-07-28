@@ -184,6 +184,25 @@ static void test_tilde_expansion(void) {
     }
 }
 
+static void test_daemon_rejects_vpx(void) {
+    const char *codecs[] = {"vp8", "vp9"};
+    for (size_t i = 0; i < ARRAY_LEN(codecs); ++i) {
+        struct scrcpy_cli_args args = {
+            .opts = scrcpy_options_default,
+            .help = false,
+            .version = false,
+        };
+        char *argv[] = {
+            "scrcpy",
+            "--daemon-port", "27183",
+            "--no-window",
+            "--video-codec", (char *) codecs[i],
+        };
+        bool ok = scrcpy_parse_args(&args, ARRAY_LEN(argv), argv);
+        assert(!ok);
+    }
+}
+
 int main(int argc, char *argv[]) {
     (void) argc;
     (void) argv;
@@ -194,5 +213,6 @@ int main(int argc, char *argv[]) {
     test_options2();
     test_parse_shortcut_mods();
     test_tilde_expansion();
+    test_daemon_rejects_vpx();
     return 0;
 }

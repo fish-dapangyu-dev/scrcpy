@@ -43,6 +43,8 @@ enum sc_codec {
     SC_CODEC_H264,
     SC_CODEC_H265,
     SC_CODEC_AV1,
+    SC_CODEC_VP8,
+    SC_CODEC_VP9,
     SC_CODEC_OPUS,
     SC_CODEC_AAC,
     SC_CODEC_FLAC,
@@ -382,6 +384,8 @@ struct scrcpy_options {
     const char *plugin_names[SC_MAX_PLUGIN_CALLS];
     const char *plugin_args[SC_MAX_PLUGIN_CALLS];
     unsigned plugin_count;
+    bool ignore_video_encoder_constraints;
+    bool update_terminal_title;
 };
 
 extern const struct scrcpy_options scrcpy_options_default;

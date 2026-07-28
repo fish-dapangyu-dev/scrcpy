@@ -137,6 +137,8 @@ const struct scrcpy_options scrcpy_options_default = {
     .note = NULL,
     .add_on_count = 0,
     .plugin_count = 0,
+    .ignore_video_encoder_constraints = false,
+    .update_terminal_title = true,
 };
 
 enum sc_orientation

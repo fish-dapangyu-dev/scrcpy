@@ -40,6 +40,7 @@ _scrcpy_auto() {
         -G
         --gamepad=
         -h --help
+        --ignore-video-encoder-constraints
         -K
         --keep-active
         --keyboard=
@@ -69,6 +70,7 @@ _scrcpy_auto() {
         --no-mipmaps
         --no-mouse-hover
         --no-power-on
+        --no-terminal-title
         --no-vd-destroy-content
         --no-vd-system-decorations
         --no-video
@@ -125,7 +127,7 @@ _scrcpy_auto() {
 
     case "$prev" in
         --video-codec)
-            COMPREPLY=($(compgen -W 'h264 h265 av1' -- "$cur"))
+            COMPREPLY=($(compgen -W 'h264 h265 av1 vp8 vp9' -- "$cur"))
             return
             ;;
         --audio-codec)
