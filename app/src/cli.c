@@ -634,7 +634,8 @@ static const struct sc_option options[] = {
         .argdesc = "port",
         .text = "Run as a persistent daemon listening on 127.0.0.1:port.\n"
                 "The device session is kept alive and served to thin clients "
-                "(see --client-port). Requires --no-window.",
+                "(see --client-port). Supports h264, h265, av1, vp8 and vp9 "
+                "video. Requires --no-window.",
     },
     {
         .longopt_id = OPT_DAEMON_HOST,
@@ -681,10 +682,10 @@ static const struct sc_option options[] = {
         .longopt = "auto-test-report",
         .argdesc = "dir",
         .text = "Record a test report into the given directory (daemon mode).\n"
-                "Starts recording the screen to <dir>/recording.mp4 "
-                "immediately and logs every client operation (with its "
-                "timestamp and optional --action) to <dir>/events.jsonl, for "
-                "rendering as an interactive report in scrcpy-auto-web.",
+                "Starts recording immediately and writes the codec-compatible "
+                "video named by <dir>/manifest.json (recording.webm for VP8, "
+                "recording.mp4 otherwise). Logs every client operation (with "
+                "its timestamp and optional --action) to <dir>/events.jsonl.",
     },
     {
         .longopt_id = OPT_ACTION,
@@ -996,9 +997,11 @@ static const struct sc_option options[] = {
     {
         .longopt_id = OPT_OUTPUT,
         .longopt = "output",
-        .argdesc = "file.mp4",
+        .argdesc = "file.mp4|file.webm",
         .text = "Save the [--clip-start, --clip-end] segment of the daemon's "
-                "recording to this MP4 file, while recording continues.\n"
+                "video timeline while recording continues. The daemon returns "
+                "WebM for VP8 and MP4 for h264, h265, av1 and vp9; use the "
+                "matching filename extension.\n"
                 "The clip starts at the closest keyframe at or before "
                 "--clip-start; the actual bounds are reported.",
     },
@@ -2758,6 +2761,44 @@ parse_render_fit(const char *optarg, enum sc_render_fit *mode) {
     return false;
 }
 
+static void
+resolve_default_mouse_bindings(struct scrcpy_options *opts) {
+    if (opts->mouse_bindings.pri.right_click != SC_MOUSE_BINDING_AUTO) {
+        return;
+    }
+
+    assert(opts->mouse_bindings.pri.middle_click == SC_MOUSE_BINDING_AUTO);
+    assert(opts->mouse_bindings.pri.click4 == SC_MOUSE_BINDING_AUTO);
+    assert(opts->mouse_bindings.pri.click5 == SC_MOUSE_BINDING_AUTO);
+    assert(opts->mouse_bindings.sec.right_click == SC_MOUSE_BINDING_AUTO);
+    assert(opts->mouse_bindings.sec.middle_click == SC_MOUSE_BINDING_AUTO);
+    assert(opts->mouse_bindings.sec.click4 == SC_MOUSE_BINDING_AUTO);
+    assert(opts->mouse_bindings.sec.click5 == SC_MOUSE_BINDING_AUTO);
+
+    static const struct sc_mouse_binding_set default_shortcuts = {
+        .right_click = SC_MOUSE_BINDING_BACK,
+        .middle_click = SC_MOUSE_BINDING_HOME,
+        .click4 = SC_MOUSE_BINDING_APP_SWITCH,
+        .click5 = SC_MOUSE_BINDING_EXPAND_NOTIFICATION_PANEL,
+    };
+
+    static const struct sc_mouse_binding_set forward = {
+        .right_click = SC_MOUSE_BINDING_CLICK,
+        .middle_click = SC_MOUSE_BINDING_CLICK,
+        .click4 = SC_MOUSE_BINDING_CLICK,
+        .click5 = SC_MOUSE_BINDING_CLICK,
+    };
+
+    // By default, forward all clicks only for UHID and AOA.
+    if (opts->mouse_input_mode == SC_MOUSE_INPUT_MODE_SDK) {
+        opts->mouse_bindings.pri = default_shortcuts;
+        opts->mouse_bindings.sec = forward;
+    } else {
+        opts->mouse_bindings.pri = forward;
+        opts->mouse_bindings.sec = default_shortcuts;
+    }
+}
+
 // Resolve a leading "~" or "~/" in a path option to $HOME. A shell does not
 // expand a tilde after '=' (e.g. --output=~/dir), so path-valued options must
 // resolve it themselves. The returned string is intentionally never freed: like
@@ -3390,13 +3431,6 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
     }
 
     if (opts->daemon_port) {
-        if (opts->video
-                && (opts->video_codec == SC_CODEC_VP8
-                    || opts->video_codec == SC_CODEC_VP9)) {
-            LOGE("--daemon-port currently supports h264, h265 and av1 video "
-                 "codecs; vp8/vp9 are available in normal scrcpy mode");
-            return false;
-        }
         if (opts->window) {
             LOGE("--daemon-port requires --no-window");
             return false;
@@ -3418,6 +3452,11 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         }
         if (opts->auto_test_report && !opts->video) {
             LOGE("--auto-test-report requires video capture (not --no-video)");
+            return false;
+        }
+        if (opts->auto_test_report && opts->flex_display) {
+            LOGE("--auto-test-report is incompatible with --flex-display "
+                 "because one report video cannot change resolution");
             return false;
         }
         // The daemon captures video for screenshots (no playback) and needs
@@ -3463,6 +3502,42 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
             opts->mirror = true;
             opts->audio = false;
             opts->audio_playback = false;
+
+            // Mirror mode reuses the stock SDL input/screen path but has no
+            // local device session. Resolve the same AUTO defaults that the
+            // normal path resolves below before returning early.
+            if (opts->keyboard_input_mode == SC_KEYBOARD_INPUT_MODE_AUTO) {
+                opts->keyboard_input_mode = SC_KEYBOARD_INPUT_MODE_SDK;
+            }
+            if (opts->mouse_input_mode == SC_MOUSE_INPUT_MODE_AUTO) {
+                opts->mouse_input_mode = SC_MOUSE_INPUT_MODE_SDK;
+            }
+            if (opts->keyboard_input_mode != SC_KEYBOARD_INPUT_MODE_SDK
+                    && opts->keyboard_input_mode
+                            != SC_KEYBOARD_INPUT_MODE_DISABLED) {
+                LOGE("Daemon mirror mode supports --keyboard=sdk or "
+                     "--keyboard=disabled; HID/AOA modes require a direct "
+                     "device session");
+                return false;
+            }
+            if (opts->mouse_input_mode != SC_MOUSE_INPUT_MODE_SDK
+                    && opts->mouse_input_mode
+                            != SC_MOUSE_INPUT_MODE_DISABLED) {
+                LOGE("Daemon mirror mode supports --mouse=sdk or "
+                     "--mouse=disabled; HID/AOA modes require a direct "
+                     "device session");
+                return false;
+            }
+            if (opts->gamepad_input_mode
+                    != SC_GAMEPAD_INPUT_MODE_DISABLED) {
+                LOGE("Daemon mirror mode requires --gamepad=disabled; "
+                     "UHID/AOA gamepads require a direct device session");
+                return false;
+            }
+            resolve_default_mouse_bindings(opts);
+            // Keep render_fit=AUTO until the mirror reads the daemon hello:
+            // flex-display is owned by the daemon and may not have been
+            // repeated on this client command line.
             return true; // skip the remaining session-oriented adjustments
         }
         // A thin-client operation was requested: no window nor device session
@@ -3607,39 +3682,7 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
         }
     }
 
-    // If mouse bindings are not explicitly set, configure default bindings
-    if (opts->mouse_bindings.pri.right_click == SC_MOUSE_BINDING_AUTO) {
-        assert(opts->mouse_bindings.pri.middle_click == SC_MOUSE_BINDING_AUTO);
-        assert(opts->mouse_bindings.pri.click4 == SC_MOUSE_BINDING_AUTO);
-        assert(opts->mouse_bindings.pri.click5 == SC_MOUSE_BINDING_AUTO);
-        assert(opts->mouse_bindings.sec.right_click == SC_MOUSE_BINDING_AUTO);
-        assert(opts->mouse_bindings.sec.middle_click == SC_MOUSE_BINDING_AUTO);
-        assert(opts->mouse_bindings.sec.click4 == SC_MOUSE_BINDING_AUTO);
-        assert(opts->mouse_bindings.sec.click5 == SC_MOUSE_BINDING_AUTO);
-
-        static struct sc_mouse_binding_set default_shortcuts = {
-            .right_click = SC_MOUSE_BINDING_BACK,
-            .middle_click = SC_MOUSE_BINDING_HOME,
-            .click4 = SC_MOUSE_BINDING_APP_SWITCH,
-            .click5 = SC_MOUSE_BINDING_EXPAND_NOTIFICATION_PANEL,
-        };
-
-        static struct sc_mouse_binding_set forward = {
-            .right_click = SC_MOUSE_BINDING_CLICK,
-            .middle_click = SC_MOUSE_BINDING_CLICK,
-            .click4 = SC_MOUSE_BINDING_CLICK,
-            .click5 = SC_MOUSE_BINDING_CLICK,
-        };
-
-        // By default, forward all clicks only for UHID and AOA
-        if (opts->mouse_input_mode == SC_MOUSE_INPUT_MODE_SDK) {
-            opts->mouse_bindings.pri = default_shortcuts;
-            opts->mouse_bindings.sec = forward;
-        } else {
-            opts->mouse_bindings.pri = forward;
-            opts->mouse_bindings.sec = default_shortcuts;
-        }
-    }
+    resolve_default_mouse_bindings(opts);
 
     if (opts->new_display) {
         if (opts->video_source != SC_VIDEO_SOURCE_DISPLAY) {

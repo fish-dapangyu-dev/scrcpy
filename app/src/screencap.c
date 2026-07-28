@@ -289,9 +289,11 @@ sc_screencap_video_packet_sink_push(struct sc_packet_sink *sink,
     sc_mutex_lock(&screencap->mutex);
 
     if (screencap->stopped || screencap->video_packet_ready) {
-        // Already captured or stopped, reject further packets
+        // Already captured or stopped: ignore further packets. A packet sink
+        // returning false fails the whole shared demuxer pipeline; it does not
+        // detach just this sink.
         sc_mutex_unlock(&screencap->mutex);
-        return false;
+        return true;
     }
 
     bool is_config = packet->pts == AV_NOPTS_VALUE;
@@ -333,9 +335,9 @@ sc_screencap_video_packet_sink_push(struct sc_packet_sink *sink,
     sc_cond_signal(&screencap->cond);
     sc_mutex_unlock(&screencap->mutex);
 
-    // Return false to detach from the demuxer pipeline after first frame
-    // This is intentional - we only need one frame
-    return false;
+    // Keep the shared packet pipeline alive until the main loop observes the
+    // screencap completion event and shuts the session down.
+    return true;
 }
 
 bool

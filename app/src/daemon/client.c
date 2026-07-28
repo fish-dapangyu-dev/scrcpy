@@ -155,8 +155,9 @@ do_screencap(sc_socket socket, const struct scrcpy_options *opts,
         goto end;
     }
     size_t written = fwrite(png, 1, payload_len, fp);
-    fclose(fp);
-    if (written != (size_t) payload_len) {
+    bool flushed = fflush(fp) == 0;
+    bool closed = fclose(fp) == 0;
+    if (written != (size_t) payload_len || !flushed || !closed) {
         LOGE("Client: failed to write %s", opts->screencap_filename);
         goto end;
     }
@@ -170,9 +171,10 @@ end:
 }
 
 // Extract [clip_start_ms, clip_end_ms] of the daemon's recording into
-// opts->clip_output (doc/daemon.md §9.5). The daemon returns the muxed MP4 as
-// the response payload and the file is written locally, so this also works
-// with a remote daemon. Under --json, prints the result (or error) object.
+// opts->clip_output (doc/daemon.md §9.5). The daemon returns a remuxed,
+// codec-compatible container as the response payload and the file is written
+// locally, so this also works with a remote daemon. Under --json, prints the
+// result (or error) object.
 static bool
 do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
         bool *json_printed) {
@@ -211,6 +213,10 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
     int64_t end_ms = 0;
     int64_t source_end_ms = 0;
     int64_t held_tail_ms = 0;
+    char *codec = NULL;
+    char *container = NULL;
+    char *extension = NULL;
+    char *mime_type = NULL;
     if (ok && (!sc_json_get_int64(&json, "payload_len", &payload_len)
                    || payload_len <= 0)) {
         LOGE("Client: missing clip payload");
@@ -221,6 +227,10 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
         sc_json_get_int64(&json, "end_ms", &end_ms);
         sc_json_get_int64(&json, "source_end_ms", &source_end_ms);
         sc_json_get_int64(&json, "held_tail_ms", &held_tail_ms);
+        sc_json_get_string(&json, "codec", &codec);
+        sc_json_get_string(&json, "container", &container);
+        sc_json_get_string(&json, "extension", &extension);
+        sc_json_get_string(&json, "mime_type", &mime_type);
     } else if (opts->json) {
         char *err = sc_json_get_raw(&json, "error");
         printf("{\"error\":%s}\n", err ? err : "{\"code\":\"E_CLIP\","
@@ -233,10 +243,10 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
         return false;
     }
 
-    uint8_t *mp4;
-    if (!sc_daemon_read_payload(socket, payload_len, &mp4)) {
+    uint8_t *payload;
+    if (!sc_daemon_read_payload(socket, payload_len, &payload)) {
         LOGE("Client: could not read clip payload");
-        return false;
+        goto end_metadata;
     }
 
     ok = false;
@@ -245,23 +255,41 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
         LOGE("Client: could not open output file: %s", opts->clip_output);
         goto end;
     }
-    size_t written = fwrite(mp4, 1, payload_len, fp);
-    fclose(fp);
-    if (written != (size_t) payload_len) {
+    size_t written = fwrite(payload, 1, payload_len, fp);
+    bool flushed = fflush(fp) == 0;
+    bool closed = fclose(fp) == 0;
+    if (written != (size_t) payload_len || !flushed || !closed) {
         LOGE("Client: failed to write %s", opts->clip_output);
         goto end;
+    }
+
+    if (extension) {
+        size_t path_len = strlen(opts->clip_output);
+        size_t ext_len = strlen(extension);
+        if (path_len < ext_len
+                || strcmp(opts->clip_output + path_len - ext_len, extension)) {
+            LOGW("Clip codec %s uses the %s container; consider naming the "
+                 "output with the %s extension (got %s)",
+                 codec ? codec : "unknown",
+                 container ? container : "reported",
+                 extension, opts->clip_output);
+        }
     }
 
     if (opts->json) {
         struct sc_strbuf out;
         if (sc_strbuf_init(&out, 128)) {
-            char tail[192];
+            char tail[320];
             snprintf(tail, sizeof(tail),
                      ",\"start_ms\":%" PRId64 ",\"end_ms\":%" PRId64
                      ",\"source_end_ms\":%" PRId64
                      ",\"held_tail_ms\":%" PRId64
+                     ",\"codec\":\"%s\",\"container\":\"%s\""
+                     ",\"extension\":\"%s\",\"mime_type\":\"%s\""
                      ",\"bytes\":%" PRId64 "}",
                      start_ms, end_ms, source_end_ms, held_tail_ms,
+                     codec ? codec : "", container ? container : "",
+                     extension ? extension : "", mime_type ? mime_type : "",
                      payload_len);
             if (sc_strbuf_append_staticstr(&out, "{\"file\":")
                     && sc_json_append_escaped(&out, opts->clip_output)
@@ -283,7 +311,12 @@ do_clip(sc_socket socket, const struct scrcpy_options *opts, int64_t id,
     ok = true;
 
 end:
-    free(mp4);
+    free(payload);
+end_metadata:
+    free(codec);
+    free(container);
+    free(extension);
+    free(mime_type);
     return ok;
 }
 

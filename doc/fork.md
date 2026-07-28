@@ -16,8 +16,8 @@ see `doc/daemon.md`.
 - `feat/control` — carries **all** fork changes. This is the branch that is
   built and shipped.
 
-Fork baseline at the time of writing: upstream scrcpy **4.0**
-(SDL3, FFmpeg 8).
+Fork baseline at the time of writing: upstream scrcpy **4.1**
+(SDL 3.4.12, FFmpeg 8.1.2).
 
 ## 2. What the fork adds (three areas)
 
@@ -60,7 +60,19 @@ screenshot/control requests from thin clients over a length-prefixed JSON
 protocol, with reconnection supervision and an on-disk registry. `--daemon-host`
 (default `127.0.0.1`) lets a client reach a remote daemon; `--json` makes the
 client emit machine-readable output (a plugin's result object, or an error
-object). All daemon code lives under `app/src/daemon/`.
+object). Protocol v4 streams all five scrcpy 4.1 video codecs (`h264`, `h265`,
+`av1`, `vp8`, `vp9`), carries camera/flex-display session metadata and exposes
+codec/container/MIME metadata for clips and reports. VP8 clip/report files use
+WebM; the other four codecs use MP4. All daemon code lives under
+`app/src/daemon/`.
+
+The fork remains additive: without daemon/client/automation flags, execution
+uses the normal upstream scrcpy 4.1 path and retains its full feature set.
+Daemon mode is intentionally headless and video/control oriented: audio,
+`--record`, OTG/AOA, V4L2, listing and app-launch are normal-session features.
+Camera daemon streams accept torch/zoom rather than screen input, and
+flex-display streams cannot use the single-file report recorder or clip
+extractor.
 
 ## 3. File inventory
 
@@ -79,12 +91,26 @@ app/src/plugins.{c,h}           plugin install/upgrade + --add-on name
 app/src/daemon/daemon.{c,h}     daemon: listener, dispatch, session supervisor
 app/src/daemon/client.{c,h}     thin client mode
 app/src/daemon/protocol.{c,h}   IPC framing + minimal JSON (uses jsmn)
+app/src/daemon/codec.{c,h}      exact enum/FFmpeg/wire codec-name mapping for
+                                h264, h265, av1, vp8 and vp9
 app/src/daemon/frame_keeper.{c,h} latest-frame sink for screenshots
-app/src/daemon/broadcaster.{c,h}  encoded-video push sink (web streaming)
+app/src/daemon/broadcaster.{c,h}  protocol-v4 encoded-video push sink; emits
+                                  fresh video_meta per stream session and
+                                  permits config-less VP8/VP9 starts; shared
+                                  immutable payloads and bounded per-client
+                                  queues isolate slow browsers; a complete
+                                  current GOP bootstraps without encoder reset
 app/src/daemon/clip_buffer.{c,h}  encoded-stream spool sink; "clip" op extracts
-                                  a [start,end] segment as a standalone MP4
-                                  while recording continues
-app/src/daemon/report.{c,h}       test-report recorder + event logger
+                                  a [start,end] segment as codec-compatible MP4
+                                  or VP8 WebM while recording continues;
+                                  preserves stream-session epochs, crosses
+                                  exactly compatible refreshes and rejects
+                                  incompatible codec/config/geometry ranges
+                                  without truncating time
+app/src/daemon/report.{c,h}       test-report recorder + event logger; manifest
+                                  owns dynamic video filename/codec/container/
+                                  MIME metadata and an exact encoded-packet
+                                  timeline/tail
 app/src/daemon/addon.{c,h}        plugin add-ons (doc/addons.md); the Unified
                                   Plugin Protocol (metadata incl. service=true
                                   long-running add-ons, adaptive path/upload
@@ -99,8 +125,9 @@ app/src/daemon/mirror.{c,h}     daemon mirror mode: `--client-port` with no op
                                 daemon's subscribe_video stream (translates
                                 daemon frames → the demuxer wire format so the
                                 STOCK demuxer/decoder/screen are reused) and
-                                forwards SDL input as inject_* requests on a
-                                second connection (doc/daemon.md §8.8)
+                                forwards SDL input, camera torch/zoom and flex
+                                display resize on a second connection
+                                (doc/daemon.md §8.8)
 app/src/third_party/jsmn.h      vendored JSON tokenizer (MIT)
 doc/daemon.md                   daemon design + implementation notes
 doc/fork.md                     this file
@@ -120,25 +147,27 @@ app/data/bash-completion/scrcpy-auto, app/data/zsh-completion/_scrcpy-auto
 | `server/meson.build` | outputs `scrcpy-auto-server`, `install_dir: 'share/scrcpy-auto'`, devenv path |
 | `app/src/server.c` | the three name defines (§2.1); everything else is upstream |
 | `app/src/cli.c` | `OPT_SCREENCAP`, `OPT_CONTROL_CMD`, `OPT_DAEMON_PORT`, `OPT_CLIENT_PORT`, `OPT_DAEMON_STOP`, `OPT_DAEMON_STATUS`, `OPT_DAEMON_RECONNECT` (enum + option table + switch cases); `print_control_usage()`; `parse_daemon_reconnect()`; daemon/client validation block near the end of `parse_args_with_getopt()` (client mode **returns early**; a `--client-port` with **no operation** sets `opts->mirror` = mirror mode instead of erroring); `!opts->daemon_port` exemption in the "video disabled" auto-off check |
-| `app/src/options.h` | fields: `screencap_filename`, `control_cmds[SC_MAX_CONTROL_CMDS]`, `control_cmd_count`, `daemon_port`, `client_port`, `mirror`, `daemon_stop`, `daemon_status`, `daemon_reconnect_none`, `daemon_reconnect_max`; `#define SC_MAX_CONTROL_CMDS 100` |
+| `app/src/options.h` | fields: `screencap_filename`, `control_cmds[SC_MAX_CONTROL_CMDS]`, `control_cmd_count`, `daemon_port`, `client_port`, `mirror`, `daemon_stop`, `daemon_status`, `daemon_reconnect_none`, `daemon_reconnect_max`; internal `SC_RECORD_FORMAT_WEBM` for VP8 reports; `#define SC_MAX_CONTROL_CMDS 100` |
 | `app/src/options.c` | defaults for the fields above |
 | `app/src/events.h` | `SC_EVENT_SCREENCAP_COMPLETED`, `SC_EVENT_SCREENCAP_ERROR` |
 | `app/src/scrcpy.c` | includes `control_exec.h`/`screencap.h`; screencap init/wiring/cleanup (search `screencap`); the `--control` execution block before `event_loop()` (calls `sc_control_exec_run(..., 1)`) |
 | `app/src/main.c` | daemon/client routing between `sc_log_configure()` and `sc_main_thread_init()`; the client branch dispatches `opts->mirror` → `sc_mirror_run()` (wrapped in `sc_main_thread_init/destroy`) vs `sc_client_run()` |
 | `app/src/util/net.{c,h}` | additive `net_local_port()` (getsockname helper) — used by mirror mode to find the ephemeral port of its loopback socket pairs |
 | `app/src/trait/packet_source.h` | `SC_PACKET_SOURCE_MAX_SINKS` 2 → **4** (decoder + broadcaster + clip buffer + recorder) |
+| `app/src/recorder.c` | internal WebM muxer mapping used by VP8 auto-test reports |
 | `app/src/icon.h` | renamed icon filenames |
 | `app/src/sdl_hints.c` | SDL app name `scrcpy-auto` |
 | `app/scrcpy-windows.rc` | InternalName/OriginalFilename/ProductName |
 | `run`, `server/build_without_gradle.sh` | renamed binary paths |
 
-Intentionally **not** changed: `release/` packaging scripts and
-`install_release.sh` still use upstream names (they build official-style
-release archives; update them if you start cutting releases).
+The `release/` packaging scripts and GitHub release workflow use the fork
+artifact names (`scrcpy-auto`, `scrcpy-auto-server`, renamed icons/manpage and
+archives). `install_release.sh` is still the upstream developer convenience
+installer and is not part of the fork release archives.
 
 ## 4. Known conflict hotspots and how to resolve them
 
-These are the exact places the scrcpy 4.0 merge conflicted, plus the ones
+These are the exact places the scrcpy 4.0/4.1 merges conflicted, plus the ones
 that will conflict on future merges. Default rule: **combine both sides**;
 never resolve by taking only the upstream hunk.
 
@@ -176,10 +205,11 @@ check these:
 |---|---|---|
 | `screencap.c` | `sc_packet_sink_ops.open()` signature | 4.0 added a `const struct sc_stream_session *` param; the fork sink had to be adapted |
 | `daemon/frame_keeper.c` | `sc_frame_sink_ops` signatures (`trait/frame_sink.h`) | same class of risk |
-| `daemon/daemon.c` | `struct sc_server_params` — **duplicated** from `scrcpy.c`'s initializer; new upstream fields must be mirrored (or the daemon silently ignores the new option) | two audio fields were missed once |
+| `daemon/daemon.c` | `struct sc_server_params` — **duplicated** from `scrcpy.c`'s initializer; new upstream fields must be mirrored (or the daemon silently ignores the new option) | two audio fields were missed once; 4.1 added `ignore_video_encoder_constraints` |
 | `daemon/daemon.c` | `sc_server_*`, `sc_demuxer_*`, `sc_decoder_init`, `sc_controller_*` signatures and callback contracts | — |
 | `control_exec.c`, `daemon/daemon.c` | `struct sc_control_msg` layout (`inject_touch_event`, `set_clipboard`), `SC_CONTROL_MSG_TYPE_RESET_VIDEO` | — |
-| `daemon/mirror.c` | the **serialized** control-message wire layout (`sc_control_msg_serialize` in `control_msg.c`): the control adapter parses the controller's bytes back into daemon `inject_*` requests, so per-type field offsets/sizes and the `enum sc_control_msg_type` order are hard-coded. A silent upstream layout change would misparse input. Re-verify the `switch` in `run_ctrl_adapter()` against `control_msg.c` on every merge (a wrong length desyncs the stream → "unknown control message type" and input disables itself, rather than crashing) | — |
+| `daemon/mirror.c` | the **serialized** control-message wire layout (`sc_control_msg_serialize` in `control_msg.c`): the control adapter parses the controller's bytes back into daemon requests, so per-type field offsets/sizes and the `enum sc_control_msg_type` order are hard-coded. Re-verify every case against `control_msg.c`, including consuming unsupported messages at their exact encoded length; 4.1 added `SCAN_FILE`, and camera/flex-display messages need explicit forwarding. A wrong length desynchronizes the stream. | 4.1 added `SCAN_FILE` |
+| `daemon/broadcaster.c`, `daemon/clip_buffer.c` | packet-sink stream-session/config semantics: codec config is optional for VP8/VP9, and every new session may change geometry | 4.1 added VP8/VP9 |
 | `daemon/protocol.c`, `daemon/client.c` | `net_*` API (`util/net.h`) | — |
 | `screencap.c`, `frame_keeper.c` | FFmpeg API level used by upstream | FFmpeg 8 migration was absorbed in the 4.0 merge |
 
@@ -220,9 +250,15 @@ grep -o '\.\w*' app/src/daemon/daemon.c | sort -u > /tmp/b
 5. **Functional smoke test** (needs a device):
    - `scrcpy-auto -s X --no-window --screencap /tmp/s.png`
    - `scrcpy-auto -s X --control "click 100 100"`
+   - normal mode: exercise VP8/VP9 and any other upstream 4.1 feature touched
+     by the merge on a device that advertises the corresponding encoder;
    - daemon: start with `--daemon-port 27400 --no-window`, then
      `--client-port 27400 --daemon-status`, `--screencap`, `--control`,
      unplug/replug the device (reconnection), `--daemon-stop`.
+   - daemon codecs: for every encoder the device supports, verify
+     `subscribe_video` for h264/h265/av1/vp8/vp9; VP8 must not wait for a
+     config packet and its clip/report manifest must identify WebM, while the
+     other codecs identify MP4.
 
 ## 7. Version history of the fork
 
@@ -234,3 +270,4 @@ grep -o '\.\w*' app/src/daemon/daemon.c | sort -u > /tmp/b
 | `b28181e3` | daemon design document (`doc/daemon.md`) |
 | `8c373c62` | daemon mode implementation |
 | `e66c1cd6` | code-review fixes for daemon mode |
+| `3e4e7aed` | merge of upstream 4.1 into `feat/control` |

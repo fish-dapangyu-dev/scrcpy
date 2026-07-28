@@ -11,12 +11,14 @@
 #include "recorder.h"
 #include "util/thread.h"
 
+struct sc_clip_buffer;
+
 /**
  * Test-report writer (DESIGN-test-report.md).
  *
  * When the daemon runs with --auto-test-report=DIR, this module:
- *  - records the device screen to DIR/recording.mp4 (via sc_recorder, a packet
- *    sink on the video demuxer),
+ *  - records the device screen to a codec-compatible container via
+ *    sc_recorder (recording.mp4, or recording.webm for VP8),
  *  - appends every logged client operation to DIR/events.jsonl with a
  *    frame-accurate, drift-free timestamp derived from the video PTS clock,
  *  - writes DIR/manifest.json at start and finalizes it on stop.
@@ -27,17 +29,29 @@
  */
 struct sc_report {
     char *dir;
-    char *video_path; // <dir>/recording.mp4
+    char *video_path;
+    const char *video_filename;
+    const char *video_codec;
+    const char *video_container;
+    const char *video_mime_type;
+    enum sc_record_format video_format;
 
-    struct sc_frame_keeper *keeper; // not owned; source of the video-time clock
+    struct sc_frame_keeper *keeper; // not owned; source of the video dimensions
+    struct sc_clip_buffer *timeline; // not owned; encoded-packet time origin
 
     struct sc_recorder recorder;
+    // Wrapper around recorder.video_packet_sink. It captures the exact
+    // session end before forwarding close(), so the recorder can extend a
+    // static final frame through the report timeline.
+    struct sc_packet_sink video_packet_sink;
     bool recorder_initialized;
     bool recorder_started;
     bool recorder_failed; // set from the recorder callback
+    bool io_failed; // event or manifest persistence failed
 
     FILE *events; // events.jsonl (append)
-    sc_mutex mutex; // guards `events`, `seq`, `recorder_failed`
+    sc_mutex mutex; // guards events, seq, gates and failure flags
+    bool accepting_events;
     uint64_t seq;
 
     char serial[128];
@@ -50,8 +64,9 @@ struct sc_report {
  */
 bool
 sc_report_init(struct sc_report *report, const char *dir,
-               struct sc_frame_keeper *keeper, const char *serial,
-               const char *device_name);
+               struct sc_frame_keeper *keeper,
+               struct sc_clip_buffer *timeline, const char *serial,
+               const char *device_name, enum sc_codec video_codec);
 
 void
 sc_report_destroy(struct sc_report *report);
@@ -69,9 +84,18 @@ sc_report_start_recording(struct sc_report *report, bool video,
 struct sc_packet_sink *
 sc_report_video_sink(struct sc_report *report);
 
+/** Whether the recorder has reported an asynchronous failure. */
+bool
+sc_report_failed(struct sc_report *report);
+
+/** Mark the report incomplete after an upstream demux/sink failure. */
+void
+sc_report_mark_failed(struct sc_report *report);
+
 /**
- * Stop, join and destroy the recorder (finalizes recording.mp4), and write the
- * final manifest. Safe to call once after start_recording().
+ * Stop, join and destroy the recorder (finalizes the codec-compatible video
+ * file), and write the final manifest. Safe to call once after
+ * start_recording().
  */
 void
 sc_report_stop_recording(struct sc_report *report);

@@ -151,7 +151,7 @@ In `run` mode the script receives these environment variables:
 | `SC_DEVICE_SERIAL` | the connected device serial |
 | `SC_REPORT_DIR` | the `--auto-test-report` directory (empty if none) |
 | `SC_VIDEO_WIDTH`, `SC_VIDEO_HEIGHT` | current video size (0 if no frame yet) |
-| `SC_VIDEO_CODEC` | video codec: `h264` / `h265` / `av1` (empty if `--no-video`) |
+| `SC_VIDEO_CODEC` | video codec: `h264` / `h265` / `av1` / `vp8` / `vp9` (empty if `--no-video`) |
 | `SC_VIDEO_BIT_RATE` | `--video-bit-rate` in bps (0 = server default) |
 | `SC_VIDEO_MAX_FPS` | `--max-fps` (empty if unset) |
 | `SC_VIDEO_MAX_SIZE` | `--max-size` in px (0 = unlimited) |

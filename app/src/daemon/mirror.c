@@ -16,14 +16,19 @@
 #include "keyboard_sdk.h"
 #include "mouse_sdk.h"
 #include "screen.h"
+#include "sdl_hints.h"
 #include "daemon/client.h"
+#include "daemon/codec.h"
 #include "daemon/protocol.h"
 #include "util/binary.h"
 #include "util/log.h"
 #include "util/net.h"
+#include "util/str.h"
 #include "util/strbuf.h"
+#include "util/term.h"
 #include "util/thread.h"
 #include "util/tick.h"
+#include "util/timeout.h"
 #include "video_regulator.h"
 
 // Demuxer wire format constants (app/src/demuxer.c; the adapter thread
@@ -32,10 +37,6 @@
 #define SC_MIRROR_PACKET_FLAG_CONFIG    (UINT64_C(1) << 62)
 #define SC_MIRROR_PACKET_FLAG_KEY_FRAME (UINT64_C(1) << 61)
 #define SC_MIRROR_PTS_MASK (SC_MIRROR_PACKET_FLAG_KEY_FRAME - 1)
-
-#define SC_MIRROR_CODEC_ID_H264 UINT32_C(0x68323634) // "h264" in ASCII
-#define SC_MIRROR_CODEC_ID_H265 UINT32_C(0x68323635) // "h265" in ASCII
-#define SC_MIRROR_CODEC_ID_AV1  UINT32_C(0x00617631) // "av1" in ASCII
 
 struct sc_mirror {
     // Two daemon connections, like scrcpy-auto-web: one becomes the one-way
@@ -122,7 +123,8 @@ mirror_resolve_host(const char *host, uint32_t *addr) {
 // optionally, the advertised device name (malloc'd)
 static sc_socket
 mirror_connect(uint32_t addr, uint16_t port, char **out_device_name,
-               char **out_state) {
+               char **out_state, char **out_video_source,
+               bool *out_flex_display) {
     sc_socket sock = net_socket();
     if (sock == SC_SOCKET_NONE) {
         return SC_SOCKET_NONE;
@@ -169,30 +171,26 @@ mirror_connect(uint32_t addr, uint16_t port, char **out_device_name,
         *out_state = NULL;
         sc_json_get_string(&hello, "state", out_state);
     }
+    if (out_video_source) {
+        *out_video_source = NULL;
+        sc_json_get_string(&hello, "video_source", out_video_source);
+    }
+    if (out_flex_display) {
+        *out_flex_display = false;
+        sc_json_get_bool(&hello, "flex_display", out_flex_display);
+    }
     free(doc);
     return sock;
 }
 
 // ---- video adapter: daemon subscribe_video events -> demuxer wire format ---
 
-static uint32_t
-mirror_codec_id(const char *codec) {
-    if (!codec || !strcmp(codec, "h264")) {
-        return SC_MIRROR_CODEC_ID_H264;
-    }
-    if (!strcmp(codec, "h265") || !strcmp(codec, "hevc")) {
-        return SC_MIRROR_CODEC_ID_H265;
-    }
-    if (!strcmp(codec, "av1")) {
-        return SC_MIRROR_CODEC_ID_AV1;
-    }
-    return 0;
-}
-
 static bool
-mirror_send_session(sc_socket sock, uint32_t width, uint32_t height) {
+mirror_send_session(sc_socket sock, uint32_t width, uint32_t height,
+                    bool client_resized) {
     uint8_t header[SC_MIRROR_PACKET_HEADER_SIZE] = {0};
     header[0] = 0x80; // session packet flag
+    header[3] = client_resized ? 1 : 0;
     sc_write32be(&header[4], width);
     sc_write32be(&header[8], height);
     return net_send_all(sock, header, sizeof(header)) == sizeof(header);
@@ -237,8 +235,19 @@ run_video_adapter(void *data) {
 
         char *event = NULL;
         if (!sc_json_get_string(&json, "event", &event)) {
+            bool response_ok;
+            if (sc_json_get_bool(&json, "ok", &response_ok)
+                    && !response_ok) {
+                // subscribe_video returns an ordinary error response while
+                // the daemon is connecting/reconnecting. Continuing to wait
+                // on this request socket would leave a permanently blank
+                // mirror because it was never promoted to a subscription.
+                LOGE("Mirror: video subscription rejected: %s", doc);
+                free(doc);
+                break;
+            }
             free(doc);
-            continue; // not an event: ignore
+            continue; // unrelated response
         }
 
         bool ok = true;
@@ -246,13 +255,19 @@ run_video_adapter(void *data) {
             char *codec = NULL;
             int64_t width = 0;
             int64_t height = 0;
+            bool client_resized = false;
             sc_json_get_string(&json, "codec", &codec);
             sc_json_get_int64(&json, "width", &width);
             sc_json_get_int64(&json, "height", &height);
-            uint32_t id = mirror_codec_id(codec);
+            sc_json_get_bool(&json, "client_resized", &client_resized);
+            uint32_t id = sc_daemon_codec_id_from_name(codec);
             if (!id) {
                 LOGE("Mirror: unsupported codec from daemon: %s",
                      codec ? codec : "(none)");
+                ok = false;
+            } else if (width <= 0 || width > UINT32_MAX
+                    || height <= 0 || height > UINT32_MAX) {
+                LOGE("Mirror: invalid video geometry from daemon");
                 ok = false;
             } else if (!codec_sent) {
                 uint8_t raw[4];
@@ -270,7 +285,8 @@ run_video_adapter(void *data) {
                 LOGI("Mirror: video stream: %s %" PRId64 "x%" PRId64,
                      codec ? codec : "h264", width, height);
                 ok = mirror_send_session(mirror->video_pair_write,
-                                         (uint32_t) width, (uint32_t) height);
+                                         (uint32_t) width, (uint32_t) height,
+                                         client_resized);
             }
             free(codec);
         } else if (!strcmp(event, "video")) {
@@ -362,8 +378,10 @@ motion_action_str(uint8_t action) {
             return "up";
         case 2: // AMOTION_EVENT_ACTION_MOVE
             return "move";
+        case 7: // AMOTION_EVENT_ACTION_HOVER_MOVE
+            return "hover_move";
         default:
-            return NULL; // e.g. HOVER_MOVE: not injectable via the daemon
+            return NULL;
     }
 }
 
@@ -426,7 +444,7 @@ run_ctrl_adapter(void *data) {
 
         // Fixed part length after the type byte, per message type
         uint8_t buf[40];
-        char json[192];
+        char json[256];
         int json_len = -1; // < 0: nothing to send
         bool parse_ok = true;
 
@@ -495,17 +513,22 @@ run_ctrl_adapter(void *data) {
                 uint32_t x = sc_read32be(&buf[9]);
                 uint32_t y = sc_read32be(&buf[13]);
                 // screen size (buf[17..20]) is stamped daemon-side
-                // pressure (buf[21..22]) is derived from the action
+                uint16_t pressure_u16 = sc_read16be(&buf[21]);
+                uint32_t action_button = sc_read32be(&buf[23]);
                 uint32_t buttons = sc_read32be(&buf[27]);
                 const char *action_str = motion_action_str(action);
                 if (!action_str) {
-                    break; // not representable (e.g. hover): drop
+                    break;
                 }
                 json_len = snprintf(json, sizeof(json),
                     "{\"id\":%" PRId64 ",\"op\":\"inject_touch\","
                     "\"action\":\"%s\",\"x\":%" PRIu32 ",\"y\":%" PRIu32
-                    ",\"pointer_id\":%" PRId64 ",\"buttons\":%" PRIu32 "}",
-                    id, action_str, x, y, pointer_id, buttons);
+                    ",\"pointer_id\":%" PRId64
+                    ",\"pressure_u16\":%" PRIu16
+                    ",\"action_button\":%" PRIu32
+                    ",\"buttons\":%" PRIu32 "}",
+                    id, action_str, x, y, pointer_id, pressure_u16,
+                    action_button, buttons);
                 break;
             }
             case SC_CONTROL_MSG_TYPE_INJECT_SCROLL_EVENT: {
@@ -517,11 +540,14 @@ run_ctrl_adapter(void *data) {
                 uint32_t y = sc_read32be(&buf[4]);
                 int16_t hscroll = (int16_t) sc_read16be(&buf[12]);
                 int16_t vscroll = (int16_t) sc_read16be(&buf[14]);
+                uint32_t buttons = sc_read32be(&buf[16]);
                 json_len = snprintf(json, sizeof(json),
                     "{\"id\":%" PRId64 ",\"op\":\"inject_scroll\","
                     "\"x\":%" PRIu32 ",\"y\":%" PRIu32
-                    ",\"hscroll\":%" PRId32 ",\"vscroll\":%" PRId32 "}",
-                    id, x, y, scroll_amount(hscroll), scroll_amount(vscroll));
+                    ",\"hscroll\":%" PRId32 ",\"vscroll\":%" PRId32
+                    ",\"buttons\":%" PRIu32 "}",
+                    id, x, y, scroll_amount(hscroll), scroll_amount(vscroll),
+                    buttons);
                 break;
             }
             case SC_CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON: {
@@ -538,9 +564,24 @@ run_ctrl_adapter(void *data) {
             }
             // Messages without a daemon equivalent: consume and drop
             case SC_CONTROL_MSG_TYPE_GET_CLIPBOARD:
-            case SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER:
-            case SC_CONTROL_MSG_TYPE_CAMERA_SET_TORCH:
                 parse_ok = ctrl_skip(mirror->ctrl_pair_read, 1);
+                break;
+            case SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER:
+                parse_ok = ctrl_read(mirror->ctrl_pair_read, buf, 1);
+                if (parse_ok && !drain_only) {
+                    json_len = snprintf(json, sizeof(json),
+                        "{\"id\":%" PRId64
+                        ",\"op\":\"set_display_power\",\"on\":%s}",
+                        id, buf[0] ? "true" : "false");
+                }
+                break;
+            case SC_CONTROL_MSG_TYPE_CAMERA_SET_TORCH:
+                parse_ok = ctrl_read(mirror->ctrl_pair_read, buf, 1);
+                if (parse_ok && !drain_only) {
+                    json_len = snprintf(json, sizeof(json),
+                        "{\"id\":%" PRId64 ",\"op\":\"camera_set_torch\","
+                        "\"on\":%s}", id, buf[0] ? "true" : "false");
+                }
                 break;
             case SC_CONTROL_MSG_TYPE_SET_CLIPBOARD: {
                 uint8_t head[13]; // sequence(8) + paste(1) + length(4)
@@ -555,18 +596,59 @@ run_ctrl_adapter(void *data) {
                         && ctrl_skip(mirror->ctrl_pair_read, len);
                 break;
             }
+            case SC_CONTROL_MSG_TYPE_SCAN_FILE: {
+                // scrcpy 4.1 added this variable-length control message. A
+                // mirror client has no local file pusher, so there is nothing
+                // to scan daemon-side, but it must still consume the complete
+                // message to keep the version-locked stream synchronized.
+                uint8_t lenbuf[4];
+                parse_ok = ctrl_read(mirror->ctrl_pair_read, lenbuf, 4)
+                        && ctrl_skip(mirror->ctrl_pair_read,
+                                     sc_read32be(lenbuf));
+                break;
+            }
             case SC_CONTROL_MSG_TYPE_RESIZE_DISPLAY:
-                parse_ok = ctrl_skip(mirror->ctrl_pair_read, 4);
+                parse_ok = ctrl_read(mirror->ctrl_pair_read, buf, 4);
+                if (parse_ok && !drain_only) {
+                    json_len = snprintf(json, sizeof(json),
+                        "{\"id\":%" PRId64 ",\"op\":\"resize_display\","
+                        "\"width\":%u,\"height\":%u}", id,
+                        sc_read16be(buf), sc_read16be(&buf[2]));
+                }
                 break;
             case SC_CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL:
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64
+                    ",\"op\":\"expand_notification_panel\"}", id);
+                break;
             case SC_CONTROL_MSG_TYPE_EXPAND_SETTINGS_PANEL:
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64
+                    ",\"op\":\"expand_settings_panel\"}", id);
+                break;
             case SC_CONTROL_MSG_TYPE_COLLAPSE_PANELS:
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64 ",\"op\":\"collapse_panels\"}", id);
+                break;
             case SC_CONTROL_MSG_TYPE_ROTATE_DEVICE:
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64 ",\"op\":\"rotate_device\"}", id);
+                break;
             case SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS:
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64
+                    ",\"op\":\"open_hard_keyboard_settings\"}", id);
+                break;
             case SC_CONTROL_MSG_TYPE_RESET_VIDEO:
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64 ",\"op\":\"reset_video\"}", id);
+                break;
             case SC_CONTROL_MSG_TYPE_CAMERA_ZOOM_IN:
             case SC_CONTROL_MSG_TYPE_CAMERA_ZOOM_OUT:
-                // 1-byte messages: nothing more to read
+                json_len = snprintf(json, sizeof(json),
+                    "{\"id\":%" PRId64 ",\"op\":\"%s\"}", id,
+                    type == SC_CONTROL_MSG_TYPE_CAMERA_ZOOM_IN
+                        ? "camera_zoom_in" : "camera_zoom_out");
                 break;
             default:
                 // Unknown message: the stream cannot be re-synchronized.
@@ -644,12 +726,33 @@ mirror_event_loop(struct sc_screen *screen) {
             case SDL_EVENT_QUIT:
                 LOGD("User requested to quit");
                 return SCRCPY_EXIT_SUCCESS;
+            case SC_EVENT_TIME_LIMIT_REACHED:
+                LOGI("Time limit reached");
+                return SCRCPY_EXIT_SUCCESS;
             default:
                 sc_screen_handle_event(screen, &event);
                 break;
         }
     }
     return SCRCPY_EXIT_FAILURE;
+}
+
+static void
+mirror_timeout_on_timeout(struct sc_timeout *timeout, void *userdata) {
+    (void) timeout;
+    (void) userdata;
+    sc_push_event(SC_EVENT_TIME_LIMIT_REACHED);
+}
+
+static void
+set_terminal_title_with_prefix(const char *value) {
+    char title[128];
+    memcpy(title, "scrcpy - ", 9);
+    size_t trunc_len = sc_str_utf8_truncation_index(value, 128 - 9 - 1);
+    assert(trunc_len <= 128 - 9 - 1);
+    memcpy(&title[9], value, trunc_len);
+    title[9 + trunc_len] = '\0';
+    sc_term_set_title(title);
 }
 
 enum scrcpy_exit_code
@@ -670,6 +773,7 @@ sc_mirror_run(const struct scrcpy_options *options) {
     static struct sc_keyboard_sdk keyboard_sdk;
     static struct sc_mouse_sdk mouse_sdk;
     static struct sc_screen screen;
+    static struct sc_timeout timeout;
 
     enum scrcpy_exit_code ret = SCRCPY_EXIT_FAILURE;
 
@@ -679,9 +783,13 @@ sc_mirror_run(const struct scrcpy_options *options) {
     bool controller_started = false;
     bool screen_initialized = false;
     bool demuxer_started = false;
+    bool timeout_initialized = false;
+    bool timeout_started = false;
 
     char *device_name = NULL;
     char *state = NULL;
+    char *video_source = NULL;
+    bool flex_display = false;
 
     uint32_t addr;
     if (!mirror_resolve_host(options->daemon_host, &addr)) {
@@ -691,7 +799,8 @@ sc_mirror_run(const struct scrcpy_options *options) {
 
     // Control/RPC connection first (its hello is reported to the user), then
     // the video connection, which becomes a one-way push stream
-    mirror->ctrl_conn = mirror_connect(addr, port, &device_name, &state);
+    mirror->ctrl_conn = mirror_connect(addr, port, &device_name, &state,
+                                       &video_source, &flex_display);
     if (mirror->ctrl_conn == SC_SOCKET_NONE) {
         goto end;
     }
@@ -699,7 +808,9 @@ sc_mirror_run(const struct scrcpy_options *options) {
          port, device_name && *device_name ? device_name : "?",
          state ? state : "?");
 
-    mirror->video_conn = mirror_connect(addr, port, NULL, NULL);
+    bool camera = video_source && !strcmp(video_source, "camera");
+
+    mirror->video_conn = mirror_connect(addr, port, NULL, NULL, NULL, NULL);
     if (mirror->video_conn == SC_SOCKET_NONE) {
         goto end;
     }
@@ -709,6 +820,9 @@ sc_mirror_run(const struct scrcpy_options *options) {
         LOGE("Mirror: could not subscribe to the video stream");
         goto end;
     }
+
+    // Apply the same SDL policy as the stock 4.1 path before SDL starts.
+    sc_sdl_set_hints(options->render_driver, options->disable_screensaver);
 
     // Minimal SDL initialization (same sequence as scrcpy())
     if (!SDL_Init(SDL_INIT_EVENTS)) {
@@ -756,13 +870,21 @@ sc_mirror_run(const struct scrcpy_options *options) {
         controller_initialized = true;
         controller_ptr = &controller;
 
-        sc_keyboard_sdk_init(&keyboard_sdk, &controller,
-                             options->key_inject_mode,
-                             options->forward_key_repeat);
-        kp = &keyboard_sdk.key_processor;
+        if (!camera) {
+            if (options->keyboard_input_mode
+                    == SC_KEYBOARD_INPUT_MODE_SDK) {
+                sc_keyboard_sdk_init(&keyboard_sdk, &controller,
+                                     options->key_inject_mode,
+                                     options->forward_key_repeat);
+                kp = &keyboard_sdk.key_processor;
+            }
 
-        sc_mouse_sdk_init(&mouse_sdk, &controller, options->mouse_hover);
-        mp = &mouse_sdk.mouse_processor;
+            if (options->mouse_input_mode == SC_MOUSE_INPUT_MODE_SDK) {
+                sc_mouse_sdk_init(&mouse_sdk, &controller,
+                                  options->mouse_hover);
+                mp = &mouse_sdk.mouse_processor;
+            }
+        }
 
         sc_controller_configure(&controller, NULL, NULL);
         if (!sc_controller_start(&controller)) {
@@ -776,17 +898,35 @@ sc_mirror_run(const struct scrcpy_options *options) {
             goto end;
         }
         ctrl_thread_started = true;
+
+        if (options->turn_screen_off) {
+            struct sc_control_msg msg = {
+                .type = SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER,
+                .set_display_power.on = false,
+            };
+            if (!sc_controller_push_msg(&controller, &msg)) {
+                LOGW("Could not request 'set display power'");
+            }
+        }
     }
 
     const char *window_title = options->window_title
                              ? options->window_title
                              : (device_name && *device_name ? device_name
                                                             : "scrcpy-auto");
+    if (options->update_terminal_title) {
+        set_terminal_title_with_prefix(window_title);
+    }
+    enum sc_render_fit render_fit = options->render_fit;
+    if (render_fit == SC_RENDER_FIT_AUTO) {
+        render_fit = flex_display ? SC_RENDER_FIT_UNSCALED
+                                  : SC_RENDER_FIT_LETTERBOX;
+    }
 
     struct sc_screen_params screen_params = {
         .video = true,
-        .camera = false,
-        .flex_display = options->flex_display,
+        .camera = camera,
+        .flex_display = flex_display,
         .controller = controller_ptr,
         .fp = NULL,
         .kp = kp,
@@ -803,9 +943,13 @@ sc_mirror_run(const struct scrcpy_options *options) {
         .window_width = options->window_width,
         .window_height = options->window_height,
         .background_color = options->background_color,
-        .window_aspect_ratio_lock = options->window_aspect_ratio_lock,
+        // A flex display is resized from the host window. Locking the host
+        // window to the current device ratio would prevent arbitrary aspect
+        // ratios and defeat the feature.
+        .window_aspect_ratio_lock =
+            flex_display ? false : options->window_aspect_ratio_lock,
         .window_borderless = options->window_borderless,
-        .render_fit = options->render_fit,
+        .render_fit = render_fit,
         .orientation = options->display_orientation,
         .mipmaps = options->mipmaps,
         .fullscreen = options->fullscreen,
@@ -837,11 +981,30 @@ sc_mirror_run(const struct scrcpy_options *options) {
     }
     demuxer_started = true;
 
+    if (options->time_limit) {
+        if (!sc_timeout_init(&timeout)) {
+            goto end;
+        }
+        timeout_initialized = true;
+        static const struct sc_timeout_callbacks cbs = {
+            .on_timeout = mirror_timeout_on_timeout,
+        };
+        if (!sc_timeout_start(&timeout,
+                              sc_tick_now() + options->time_limit,
+                              &cbs, NULL)) {
+            goto end;
+        }
+        timeout_started = true;
+    }
+
     ret = mirror_event_loop(&screen);
 
     sc_main_thread_stop();
 
 end:
+    if (timeout_started) {
+        sc_timeout_stop(&timeout);
+    }
     if (controller_started) {
         sc_controller_stop(&controller);
     }
@@ -898,6 +1061,12 @@ end:
     if (controller_initialized) {
         sc_controller_destroy(&controller);
     }
+    if (timeout_started) {
+        sc_timeout_join(&timeout);
+    }
+    if (timeout_initialized) {
+        sc_timeout_destroy(&timeout);
+    }
 
     if (mirror->video_pair_read != SC_SOCKET_NONE) {
         net_close(mirror->video_pair_read);
@@ -920,5 +1089,6 @@ end:
 
     free(device_name);
     free(state);
+    free(video_source);
     return ret;
 }

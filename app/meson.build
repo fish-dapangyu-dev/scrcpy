@@ -35,6 +35,7 @@ src = [
     'src/daemon/broadcaster.c',
     'src/daemon/client.c',
     'src/daemon/clip_buffer.c',
+    'src/daemon/codec.c',
     'src/daemon/daemon.c',
     'src/daemon/frame_keeper.c',
     'src/daemon/mirror.c',
@@ -182,7 +183,7 @@ conf.set_quoted('SCRCPY_VERSION', meson.project_version())
 # the prefix used during configuration (meson --prefix=PREFIX)
 conf.set_quoted('PREFIX', get_option('prefix'))
 
-# build a "portable" version (with scrcpy-server accessible from the same
+# build a "portable" version (with scrcpy-auto-server accessible from the same
 # directory as the executable)
 conf.set('PORTABLE', get_option('portable'))
 
@@ -248,6 +249,17 @@ if get_option('buildtype') == 'debug'
         ['test_binary', [
             'tests/test_binary.c',
         ]],
+        ['test_broadcaster', [
+            'tests/test_broadcaster.c',
+            'src/daemon/broadcaster.c',
+            'src/daemon/codec.c',
+            'src/daemon/protocol.c',
+            'src/util/log.c',
+            'src/util/net.c',
+            'src/util/strbuf.c',
+            'src/util/thread.c',
+            'src/util/tick.c',
+        ]],
         ['test_audiobuf', [
             'tests/test_audiobuf.c',
             'src/util/audiobuf.c',
@@ -270,6 +282,10 @@ if get_option('buildtype') == 'debug'
             'src/util/thread.c',
             'src/util/tick.c',
         ]],
+        ['test_daemon_codec', [
+            'tests/test_daemon_codec.c',
+            'src/daemon/codec.c',
+        ]],
         ['test_command_windows', [
           'tests/test_command_windows.c',
           'src/util/command.c',
@@ -289,6 +305,17 @@ if get_option('buildtype') == 'debug'
         ['test_orientation', [
             'tests/test_orientation.c',
             'src/options.c',
+        ]],
+        ['test_recorder', [
+            'tests/test_recorder.c',
+            'src/recorder.c',
+            'src/options.c',
+            'src/util/log.c',
+            'src/util/memory.c',
+            'src/util/str.c',
+            'src/util/strbuf.c',
+            'src/util/thread.c',
+            'src/util/tick.c',
         ]],
         ['test_strbuf', [
             'tests/test_strbuf.c',

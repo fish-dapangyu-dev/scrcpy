@@ -55,6 +55,15 @@ struct sc_recorder {
 
     bool video_expects_config_packet;
     bool audio_expects_config_packet;
+    // AV1 config packets after an encoder reset must be prepended to the next
+    // media sample; unlike H.26x, the demuxer does not merge them.
+    bool video_merges_late_config;
+
+    // Optional exact end of the video timeline, relative to the first media
+    // packet. The report wrapper sets it when its packet sink closes so a
+    // static final screen is held through the real session end.
+    int64_t video_end_target_us;
+    int64_t video_duration_us;
 
     struct sc_recorder_stream video_stream;
     struct sc_recorder_stream audio_stream;
@@ -80,8 +89,22 @@ sc_recorder_start(struct sc_recorder *recorder);
 void
 sc_recorder_stop(struct sc_recorder *recorder);
 
+/**
+ * Request that the last video sample extend through `end_us`, relative to the
+ * first recorded media packet. May be called more than once; the furthest end
+ * wins. It does not stop the recorder.
+ */
+void
+sc_recorder_set_video_end(struct sc_recorder *recorder, int64_t end_us);
+
 void
 sc_recorder_join(struct sc_recorder *recorder);
+
+/**
+ * Actual finalized video duration in microseconds (valid after join).
+ */
+int64_t
+sc_recorder_get_video_duration(struct sc_recorder *recorder);
 
 void
 sc_recorder_destroy(struct sc_recorder *recorder);

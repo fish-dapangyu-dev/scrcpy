@@ -61,7 +61,10 @@ bool
 sc_daemon_write_frame(sc_socket socket, const char *json, size_t json_len,
                       const uint8_t *payload, size_t payload_len) {
     assert(json_len && json_len <= SC_DAEMON_MAX_FRAME_SIZE);
-    assert(payload_len <= SC_DAEMON_MAX_FRAME_SIZE);
+    if (payload_len > SC_DAEMON_MAX_BINARY_PAYLOAD) {
+        LOGE("Daemon protocol: payload exceeds 1 GiB limit");
+        return false;
+    }
 
     uint8_t header[4];
     sc_write32be(header, (uint32_t) json_len);
@@ -82,7 +85,7 @@ sc_daemon_write_frame(sc_socket socket, const char *json, size_t json_len,
 
 bool
 sc_daemon_read_payload(sc_socket socket, size_t len, uint8_t **out_data) {
-    if (!len || len > SC_DAEMON_MAX_FRAME_SIZE) {
+    if (!len || len > SC_DAEMON_MAX_BINARY_PAYLOAD) {
         return false;
     }
 

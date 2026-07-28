@@ -1,10 +1,9 @@
 # Persistent daemon mode — design document
 
 Status: **v1 implemented** (phases 0–2 plus reconnection; see §15 — remaining:
-`--client-serial` registry resolution, protocol/registry unit tests in the
-meson test harness)
+`--client-serial` registry resolution and some registry coverage)
 Target branch: `feat/control`
-Applies to: scrcpy-auto (fork of scrcpy 4.0)
+Applies to: scrcpy-auto (fork of scrcpy 4.1), daemon protocol v4
 
 Implementation notes (deviations from the original proposal):
  - Instead of refactoring `scrcpy()` into a shared `sc_session` module
@@ -34,6 +33,18 @@ Implementation notes (deviations from the original proposal):
  - `--control` takes a required argument (`--control help` prints the
    command reference), so both `--control "click 1 2"` and
    `--control="click 1 2"` work.
+ - The normal, non-daemon execution path remains the upstream scrcpy 4.1
+   path. In particular, all five upstream video codecs (`h264`, `h265`,
+   `av1`, `vp8`, `vp9`) and the other 4.1 options remain available when none
+   of the fork's daemon/client options are used.
+ - Protocol v4 carries all five codecs on `subscribe_video`. VP8/VP9 do not
+   require a separate codec-config packet. Clip and report metadata declare
+   the actual codec, container and MIME type; VP8 uses WebM, while the other
+   four codecs use MP4.
+ - Daemon and mirror mode preserve the applicable upstream 4.1 controls:
+   `--ignore-video-encoder-constraints`, camera/flex-display metadata,
+   `--time-limit`, `--turn-screen-off`, terminal titles and complete SDK
+   mouse semantics (hover, pressure, action button and held buttons).
 
 ---
 
@@ -99,7 +110,7 @@ existing design unusually well. The load-bearing facts:
 | Long-lived device session | The client↔device session already lives until `sc_server_stop()`; `run_server()` just parks in a condvar wait after connect (`app/src/server.c:1119`). Nothing times out on its own. |
 | Injecting input from an arbitrary thread | `sc_controller_push_msg()` (`app/src/controller.h:68`) is a mutex-protected queue drained by the controller thread. The `feat/control` command executor already pushes from worker threads. |
 | Keeping "the latest frame" for screenshots | `struct sc_frame_buffer` (`app/src/frame_buffer.h:21`) already implements exactly this: it retains the most recent decoded `AVFrame` under a mutex. The daemon adds a *frame keeper* sink reusing it. |
-| Attaching extra consumers to the video stream | Packet sources and frame sources are multi-sink by design (`SC_PACKET_SOURCE_MAX_SINKS` = 3, `SC_FRAME_SOURCE_MAX_SINKS` = 2). |
+| Attaching extra consumers to the video stream | Packet sources and frame sources are multi-sink by design; the fork keeps enough packet-sink slots for decoder, broadcaster, clip spool and report recorder. |
 | Forcing a fresh keyframe on demand | `SC_CONTROL_MSG_TYPE_RESET_VIDEO` (`app/src/control_msg.h:45`) makes the device encoder restart and emit an IDR frame — useful for freshness guarantees (§9.4). |
 | Cross-platform sockets | `app/src/util/net.c` already wraps TCP for Linux/macOS/Windows; the IPC listener reuses it. |
 | Interruptible blocking calls | `sc_intr` / `net_interrupt` allow clean shutdown of every blocking call. |
@@ -110,7 +121,7 @@ existing design unusually well. The load-bearing facts:
 1. **Session re-entrancy.** `scrcpy()` (`app/src/scrcpy.c`) is written as a
    one-shot function: a `static struct scrcpy` instance, a `goto end` cleanup
    ladder, and `main()` calls it exactly once (`app/src/main.c:93`). Upstream
-   4.0's "disconnected" feature does *not* reconnect — it shows an icon until
+   scrcpy's "disconnected" feature does *not* reconnect — it shows an icon until
    a timeout and exits (`sc_screen_handle_disconnection()`,
    `app/src/screen.c:1198`). A daemon must be able to tear down and rebuild
    the device session *within one process* (§10). This requires extracting
@@ -123,12 +134,12 @@ existing design unusually well. The load-bearing facts:
    keeper (§9.2).
 
 3. **Why we cannot just reuse the current `--screencap` sink per request:**
-   the existing implementation waits for a *config packet + keyframe*, which
-   the device only sends at stream start. On an already-running stream, a
-   newly attached packet sink would wait indefinitely (H.264 P-frames are
-   undecodable without the preceding reference chain). Persistent screenshots
-   therefore require either continuous decode (chosen, §9.2) or per-request
-   `RESET_VIDEO` (rejected as primary, §9.4).
+   a newly attached packet sink in the middle of a stream may receive an
+   inter-frame without its preceding reference chain. Codec config is also
+   not a universal synchronization point (VP8/VP9 may not send a separate
+   config packet). Persistent screenshots therefore require either continuous
+   decode (chosen, §9.2) or per-request `RESET_VIDEO` (rejected as primary,
+   §9.4).
 
 4. **The IPC layer itself** — listener, protocol, request dispatch, thin
    client mode (§8).
@@ -159,12 +170,37 @@ LOC client-side plus a ~400-line refactor of `scrcpy.c` (§15).
 
 **Non-goals (v1)** — listed as future work in §16:
 
-- Streaming video/audio to clients over IPC.
+- Streaming audio to clients over IPC. Encoded video subscription is
+  implemented by `subscribe_video` (§8.7).
 - A daemon with a visible mirroring window (`--daemon-port` requires
-  `--no-window` in v1).
-- Remote (non-localhost) clients, authentication, encryption.
+  `--no-window`); a separate `--client-port` process provides mirror mode.
+- Authentication and encryption for remote clients. `--daemon-host` supports
+  connecting to a daemon through an already trusted/restricted transport; the
+  protocol itself adds no security boundary.
 - One daemon managing several devices (§11 explains why).
 - OTG/AOA (USB HID) mode in the daemon.
+
+### 3.1 scrcpy 4.1 compatibility boundary
+
+The fork is additive: normal scrcpy mode keeps the complete upstream 4.1
+feature set. Daemon mode is a separate, headless IPC architecture and supports
+the 4.1 capture-side features that map to that architecture, including all five
+video codecs, camera capture/options, flex-display resize, and
+`--ignore-video-encoder-constraints`.
+
+Architecture-specific daemon restrictions are explicit:
+
+- audio is disabled; `--record`, OTG/AOA, V4L2, `--list-*` and `--start-app`
+  remain normal-session features;
+- the daemon itself has no SDL window, but mirror clients render its encoded
+  stream;
+- camera streams are view-only except for camera torch/zoom controls (screen
+  touch, text, key and scroll injection do not apply to a camera source);
+- flex display may change stream geometry, so clip extraction and the
+  single-file `--auto-test-report` recorder are rejected for that mode.
+
+These restrictions do not remove or weaken the corresponding upstream 4.1
+features in normal scrcpy mode.
 
 ---
 
@@ -210,13 +246,13 @@ Three roles:
 |---|---|---|---|
 | `--daemon-port PORT` | daemon | 1–65535 | Run as daemon; listen on 127.0.0.1:PORT. |
 | `--client-port PORT` | client | 1–65535 | Run as thin client of the daemon on 127.0.0.1:PORT. |
-| `--client-serial SERIAL` | client | serial | Alternative to `--client-port`: resolve the port via the registry (§7.2). |
+| `--client-serial SERIAL` | planned | serial | Future alternative to `--client-port`; registry resolution is not implemented yet (§7.2). |
 | `--daemon-reconnect POLICY` | daemon | `auto[:MAX]` \| `none` | Device-loss policy; default `auto` (unbounded retries, §10). |
 | `--daemon-stop` | client | — | Ask the daemon to shut down gracefully. |
 | `--daemon-status` | client | — | Print daemon/session state as JSON to stdout. |
 | `--clip-start SECONDS` | client | ≥ 0, decimals ok | Start of a recording segment to extract (`clip` op); with `--clip-end` and `--output`. |
 | `--clip-end SECONDS` | client | > start | End of the segment; must already be recorded, else the command fails (`E_RANGE`). |
-| `--output FILE.mp4` | client | path | Where the extracted segment is written (by the client). |
+| `--output FILE.mp4\|FILE.webm` | client | path | Where the extracted segment is written (by the client). VP8 produces WebM; H.264/H.265/AV1/VP9 produce MP4. |
 
 Implementation: new `OPT_*` enum entries and `sc_option` rows in
 `app/src/cli.c`, new fields in `struct scrcpy_options` (`app/src/options.h`):
@@ -227,19 +263,27 @@ enum sc_daemon_reconnect daemon_reconnect; bool daemon_stop; bool daemon_status;
 
 Validated at the end of `parse_args()`; violations are fatal CLI errors.
 
-- `--daemon-port` **excludes** `--client-port`, `--client-serial`,
+- `--daemon-port` **excludes** `--client-port`,
   `--screencap`, `--control`, `--record`, `--v4l2-sink`, `--otg`,
-  `--list-*`, `--start-app`, `--tcpip=+addr` is allowed (any device-selection
-  option is allowed — the daemon owns device selection).
+  `--list-*` and `--start-app`. Device-selection and `--tcpip` options are
+  allowed because the daemon owns the device session.
 - `--daemon-port` **requires** `--no-window` (v1; see §6.2) and `--control`
   capability enabled (i.e. it is an error to combine with `-n/--no-control`
   unless screenshots-only operation is intended — allowed but logged).
-- `--client-port`/`--client-serial` **exclude** every option that concerns
-  session creation: `-s`, `-d`, `-e`, `--tcpip`, port/tunnel options,
-  codec/bit-rate options, window options, `--record`, `--otg`, …
-  Allowed with: `--screencap FILE`, `--control CMD` (repeatable),
-  `--daemon-stop`, `--daemon-status`, `--time-limit` (as request timeout).
+- `--client-port` **excludes** device selection (`-s`, `-d`, `-e`,
+  `--tcpip`) plus `--record`, OTG/AOA, V4L2, `--list-*` and `--start-app`.
+  Mirror mode supports SDK/disabled keyboard and mouse input. UHID/AOA
+  keyboard, mouse and gamepad modes require a direct device session and are
+  rejected explicitly rather than ignored.
+  Thin-client operations include `--screencap FILE`, `--control CMD`
+  (repeatable), clip extraction, `--note`, add-on operations,
+  `--daemon-stop` and `--daemon-status`. With no operation it enters mirror
+  mode, where normal window/render/input options apply; capture codec and
+  geometry still belong to the daemon that owns the device session.
 - `--daemon-stop`/`--daemon-status` require client mode.
+- `--auto-test-report` requires daemon video and excludes `--flex-display`;
+  clip extraction also rejects a flex-display stream because its encoded
+  geometry can change within one timeline.
 
 If none of the new flags are present, behavior is bit-for-bit today's (§13).
 
@@ -264,9 +308,10 @@ Reuses `enum scrcpy_exit_code`:
    fails (`EADDRINUSE`), exit immediately with a clear error — this is the
    "already running?" check, race-free because the OS arbitrates the port.
 3. Write the registry entry (§7.1) marked `"state": "starting"`.
-4. Start the device session (existing `sc_server_start()` path) with
-   `video=true, audio=false (default), control=true, video_playback=off,
-   window=off`, plus the daemon frame keeper (§9.2).
+4. Start the device session (existing `sc_server_start()` path) with the
+   requested video/control capture parameters, `audio=false`,
+   `video_playback=off`, `window=off`, plus the daemon frame keeper when video
+   is enabled (§9.2).
 5. On `on_connected`: mark registry `"ready"`, log
    `Daemon ready on 127.0.0.1:PORT (device XXX)`.
 6. Serve requests until stopped.
@@ -300,7 +345,9 @@ for cross-thread signalling (§9.1).
 
 ### 6.4 Idle policy
 
-None in v1: the session stays up 24/7. Note for users: a mirrored device
+By default the session stays up indefinitely. `--time-limit` stops the daemon
+at the same session-relative deadline as normal scrcpy, and
+`--turn-screen-off` is sent once the controller is ready. A mirrored device
 keeps its encoder pipeline active; combine with `--screen-off-timeout`,
 `--turn-screen-off`, `--stay-awake`, and a modest `--max-fps` (§9.2) to bound
 device-side cost.
@@ -329,7 +376,7 @@ One JSON file per daemon, named `<port>.json`, written atomically
   "device_name": "Pixel 8",
   "state": "ready",
   "started_at": "2026-07-03T10:00:00Z",
-  "protocol": 1
+  "protocol": 4
 }
 ```
 
@@ -338,8 +385,9 @@ One JSON file per daemon, named `<port>.json`, written atomically
 1. `--client-port PORT` → connect to `127.0.0.1:PORT` directly. The registry
    is *not* consulted; the port is the source of truth (the user's requested
    UX works even if the registry dir is wiped).
-2. `--client-serial SERIAL` → scan registry, pick the live entry with that
-   serial; error if none/ambiguous.
+2. `--client-serial SERIAL` is a planned resolver: scan registry, pick the live
+   entry with that serial, and error if none/ambiguous. It is not currently a
+   CLI option.
 3. Neither given (future convenience, still specified): if the registry holds
    exactly one **live** entry, use it; if zero → error `no scrcpy-auto daemon
    running`; if several → error listing them (`use --client-port or
@@ -382,8 +430,9 @@ printf (the schema is small and flat). No new external build dependency.
 On connect, the **daemon speaks first** (avoids a client round trip):
 
 ```json
-{"event":"hello","protocol":3,"app":"scrcpy-auto","version":"4.0",
+{"event":"hello","protocol":4,"app":"scrcpy-auto","version":"4.1",
  "pid":12345,"serial":"DEVICEID_XX1","device_name":"Pixel 8","state":"ready",
+ "video_source":"display","flex_display":false,
  "plugins":["exec_prompt|arg=ref-images:pathlist:optional|result=exec_prompt_result|meta=description:AI action"]}
 ```
 
@@ -408,17 +457,22 @@ allowing pipelining (v1 clients send sequentially, the field future-proofs).
 | `op` | Params | Success response extras |
 |---|---|---|
 | `ping` | — | — |
-| `status` | — | `protocol`, `app`, `version`, `state`, `serial`, `device_name`, `uptime_ms`, `last_frame_age_ms`, `plugins` (same advertised schema array as the hello), `report` (`enabled`, and when enabled `dir` / `recording` / `video` = the `recording.mp4` path, `recorded_ms` = wall-elapsed report time, `source_end_ms` = last encoded-packet PTS, `held_tail_ms` = their current static-frame gap), `config` (the referenced capture params: `port`, `control`, `video`, and when video is on `codec` / `bit_rate` / `max_size` / `max_fps` / `encoder`) |
+| `status` | — | `protocol`, `app`, `version`, `state`, `serial`, `device_name`, `video_source`, `flex_display`, `uptime_ms`, `last_frame_age_ms`, `plugins` (same advertised schema array as the hello), `report` (`enabled`, and when enabled `dir`, `recording`, dynamic `video` path, `codec`, `container`, `mime_type`, `recorded_ms`, `source_end_ms`, `held_tail_ms`), and `config` (the referenced capture params: `port`, `control`, `video`, and when video is on `codec`, `bit_rate`, `max_size`, `max_fps`, `encoder`) |
 | `screencap` | `format` (`"png"`, only value in v1), `max_age_ms` (optional, §9.4) | `width`, `height`, `payload_len` + PNG bytes as payload |
 | `control` | `cmds`: array of strings — each string one `--control` argument, same mini-language and same parallel/`&&` semantics as the CLI (`sc_control_exec_run`, `app/src/control_exec.c`) | — (returns after execution completes, like the CLI does) |
-| `inject_touch` | `action` (`down`/`up`/`move`), `x`, `y` (video-pixel space), optional `pointer_id`, `buttons` | — (non-blocking; enqueues one touch event) |
+| `inject_touch` | `action` (`down`/`up`/`move`/`hover_move`), `x`, `y` (video-pixel space), optional `pointer_id`, `pressure_u16` (0–65535), `action_button`, `buttons` | — (non-blocking; enqueues one touch/mouse event) |
 | `inject_key` | `action` (`down`/`up`), `keycode` (Android), optional `metastate`, `repeat` | — |
 | `inject_text` | `text` (UTF-8) | — |
-| `inject_scroll` | `x`, `y` (video-pixel space), optional `hscroll`, `vscroll` | — |
+| `inject_scroll` | `x`, `y` (video-pixel space), optional `hscroll`, `vscroll`, `buttons` | — |
+| `camera_set_torch` | `on` (boolean) | —; camera source only |
+| `camera_zoom_in` / `camera_zoom_out` | — | —; camera source only |
+| `resize_display` | `width`, `height` (1–65535) | —; daemon must have been started with `--flex-display` |
+| `set_display_power` | `on` (boolean) | — |
+| `expand_notification_panel` / `expand_settings_panel` / `collapse_panels` / `rotate_device` / `open_hard_keyboard_settings` / `reset_video` | — | —; direct mappings of the corresponding upstream control messages |
 | `note` | `note`: a `"title: description"` annotation | — (logged to the test report as a `note` event with `title`/`text`; standalone, not tied to any control command) |
 | `plugin` | `name`, `args`, optional `arg_names`/`arg_values` (parallel string arrays of the declared extra arguments) | runs the loaded add-on registered for `name` with `args` as `$1`, each extra argument exported as `SC_ARG_<NAME>`, and a `SC_RESULT_FILE` temp path (doc/addons.md); blocks until the script exits; auto-logs a `plugin` report event; returns `result` (the JSON the script wrote to `SC_RESULT_FILE`, if any) |
 | `upload` | `name` (a basename), `payload_len` + that many raw payload bytes after the JSON frame | stores the payload in a per-connection temp file (removed on disconnect) and returns its daemon-side `path`; used to ship a `path`/`pathlist` argument's bytes when the client (or web server) is remote |
-| `clip` | `start_ms`, `end_ms` (ms on the report/session timeline, `0 <= start < end`) | `start_ms`, `end_ms` (actual clip bounds: start snaps back to a keyframe; end stays exact), `source_end_ms` (last included encoded-packet PTS), `held_tail_ms` (final sample hold), `payload_len` + a standalone MP4 as payload. The daemon spools every encoded packet of the current stream session (`app/src/daemon/clip_buffer.c`, a demuxer sink independent of the recorder) and muxes the selected range in memory with timestamps rebased to 0; the CLIENT writes the file, so remote clients work and the daemon needs no write access. An `end_ms` beyond the wall-elapsed session position is an `E_RANGE` error. |
+| `clip` | `start_ms`, `end_ms` (ms on the report/session timeline, `0 <= start < end`) | `start_ms`, `end_ms` (actual clip bounds: start snaps back to a keyframe; end stays exact), `source_end_ms`, `held_tail_ms`, `codec`, `container`, `extension`, `mime_type`, and `payload_len` + a standalone video payload. VP8 is muxed as WebM; H.264/H.265/AV1/VP9 are muxed as MP4. The daemon spools encoded packets independently of the report recorder and muxes the selected range in memory with timestamps rebased to 0; the CLIENT writes the file. An `end_ms` beyond the elapsed encoded-stream timeline is `E_RANGE`; compatible encoder refresh epochs may be crossed, while an incompatible codec/config/geometry boundary is `E_SESSION`; flex-display clips are `E_UNSUPPORTED`; output beyond the 1 GiB binary-frame bound is `E_TOO_LARGE`. |
 | `subscribe_video` | — | turns the connection into a one-way encoded-video push stream (see §8.7); no `ok` reply — the first `video_meta` event is the ack |
 | `shutdown` | — | — (daemon exits after responding) |
 
@@ -442,24 +496,40 @@ sequence of protocol frames (a second daemon connection is used for input, so
 the two never interleave). The frames:
 
 ```json
-{"event":"video_meta","codec":"h264","width":W,"height":H}
-{"event":"video","config":true,"key":false,"payload_len":N}   + N bytes (SPS/PPS)
+{"event":"video_meta","codec":"h264|h265|av1|vp8|vp9","width":W,"height":H,"client_resized":BOOL}
+{"event":"video","config":true,"key":false,"payload_len":N}   + N config bytes
 {"event":"video","config":false,"key":BOOL,"payload_len":N}   + N bytes (frame)
 ```
 
-A newly subscribing client first receives the current `video_meta` and the
-stored config packet, then live frames. On device reconnection / resolution
-change, a fresh `video_meta` (and a new config packet) is pushed to all
-subscribers so they can reconfigure their decoder. Implemented by
+A newly subscribing client first receives the current `video_meta`, then a
+stored config packet when that codec/session provides one, then the complete
+cached GOP from its keyframe through the current frame before joining live
+frames. This is decoder-safe without restarting the device encoder, so merely
+opening or refreshing a page does not create a recording/timeline boundary.
+The config event is optional: in particular VP8/VP9 may start directly with
+frame packets, so consumers must configure those decoders from `video_meta`
+instead of waiting for `config:true`. On device reconnection, encoder restart
+or resolution change, a fresh `video_meta` is pushed to all subscribers;
+any config from the previous stream is discarded before the new stream is
+announced. A new config packet follows only when the new stream emits one.
+Implemented by
 `app/src/daemon/broadcaster.c`, a second packet sink on the video demuxer
 (the first still decodes for `screencap`). The bytes are the device encoder's
-Annex-B output, forwarded verbatim — no re-encoding — so a browser can decode
-them directly with WebCodecs.
+encoded output, forwarded verbatim with no re-encoding.
 
-Caveat: the broadcaster writes to subscribers under a lock held on the demuxer
-thread; a stalled subscriber applies backpressure to the video pipeline. Fine
-for a localhost bridge; a per-subscriber queue would be needed for slow/remote
-consumers.
+For a camera source, mirror-mode touch/key/text/scroll input is disabled;
+camera torch and zoom shortcuts are translated to the camera operations above.
+For a flex display, mirror window resize events become `resize_display`
+requests, and the resulting stream-session geometry change is announced by a
+new `video_meta`.
+
+Each subscriber owns a bounded queue drained by its connection thread. Encoded
+payloads are immutable and reference-counted across the GOP cache and queues,
+so fan-out does not copy frame bytes per browser. A stalled subscriber cannot
+block the demuxer, clip spool or report recorder: on overflow only that queue
+is discarded and atomically rebuilt from the shared current GOP. Idle streams
+send a five-second keepalive so abandoned sockets are detected even when the
+screen does not change.
 
 ### 8.4 Error codes
 
@@ -470,6 +540,9 @@ consumers.
 | `E_DEVICE_DISCONNECTED` | lost mid-request | 1 |
 | `E_TIMEOUT` | op exceeded its deadline (e.g. no frame, §9.3) | 1 |
 | `E_BUSY` | conflicting exclusive op in progress (§14.4) | 1 |
+| `E_UNSUPPORTED` | operation does not map to the active daemon architecture/source (for example touch on a camera source or clip on a flex display) | 1 |
+| `E_SESSION` | clip range crosses an incompatible codec/config/geometry boundary and must be split at the reported boundary | 1 |
+| `E_TOO_LARGE` | binary clip payload would exceed the 1 GiB protocol bound; request a smaller range | 1 |
 | `E_SHUTDOWN` | daemon stopping | 1 |
 | `E_INTERNAL` | anything else; details in message | 1 |
 
@@ -519,13 +592,14 @@ Implementation (`app/src/daemon/mirror.c`): two daemon connections, like
 - **Control connection** carries input: the stock `sc_controller` serializes
   the SDL-derived control messages to another loopback socket, and a thread
   parses them back into `inject_touch` / `inject_key` / `inject_text` /
-  `inject_scroll` requests. Messages without a daemon equivalent are dropped.
-  If the daemon rejects input (e.g. the iOS bridge, which is view-only), it is
-  logged once and rendering continues.
+  `inject_scroll` requests. Camera torch/zoom and flex-display resize messages
+  use their dedicated daemon operations; version-locked messages without a
+  daemon equivalent are consumed safely and dropped. If the daemon rejects an
+  input operation, it is logged once and rendering continues.
 
-This makes any protocol-v3 source playable in the real client, including the
-scrcpy-auto-ios bridge (`--client-port <bridge-port>` → live iPhone mirror,
-input rejected as expected).
+This makes a protocol-v4 encoded-video source playable in the real client.
+External bridges must use the same protocol version and v4 codec/config
+semantics; protocol-v3 bridges are rejected by the version handshake.
 
 ---
 
@@ -599,8 +673,8 @@ restarts the encoder, costing ~100–300 ms.
 The clip spool stores encoded packets and their original PTS. Packet PTS is
 not an availability clock: Android MediaCodec may emit nothing for many
 seconds while the display is static. The report/event clock therefore uses
-wall elapsed time since the first decoded frame, and `clip.end_ms` is checked
-only against that session clock.
+monotonic elapsed time since the first encoded media packet (the same origin
+as packet PTS 0), and `clip.end_ms` is checked only against that stream clock.
 
 Extraction selects packets in the half-open range `[start_ms, end_ms)`,
 snapping the start back to a decodable keyframe. Every selected packet keeps
@@ -614,9 +688,29 @@ The response separates:
 - `source_end_ms`: the last included encoded packet position;
 - `held_tail_ms`: `end_ms - source_end_ms`.
 
-The session clock freezes when the frame sink closes. A request beyond that
+The session clock freezes when the encoded packet sink closes. A request beyond that
 frozen position returns `E_RANGE`; small process-termination corrections are
 an upper-layer policy and the daemon never silently truncates a Case.
+
+The spool keeps codec parameters and config per stream-session epoch. A clip
+must be internally decodable with one codec/geometry description. Encoder
+refresh epochs whose codec parameters and config are byte-for-byte compatible
+are transparent; a genuinely incompatible codec/config/geometry boundary
+returns `E_SESSION` with its timestamp instead of silently mixing stale config
+with new packets. Historical packets remain available; the caller can split
+the request at the exact boundary without changing the report timeline.
+
+Clip and report output follow the active codec instead of assuming MP4. VP8
+uses WebM (`.webm`, `video/webm`); H.264, H.265, AV1 and VP9 use MP4
+(`.mp4`, `video/mp4`). A clip response declares `codec`, `container`,
+`extension` and `mime_type`, and the client warns when `--output` has a
+different extension.
+
+For `--auto-test-report`, `manifest.json` is the source of truth. Its
+`video.file` field is `recording.webm` for VP8 and `recording.mp4` otherwise;
+the same `video` object records `codec`, `container`, `mime_type`, dimensions,
+duration and `finalized`. Consumers must resolve the video filename from the
+manifest rather than hard-code `recording.mp4`.
 
 ### 9.6 Control command execution
 
@@ -726,8 +820,8 @@ warning if the registry already holds a live entry for its serial.
   the same machine. Registry files are `0600` in a `0700` dir.
 - No secrets in the protocol; no shell execution server-side (the `control`
   mini-language maps to fixed control messages, never to `sh`).
-- Frame cap (64 MiB) and request-size limits guard against memory abuse by
-  local processes.
+- JSON/realtime frame caps (64 MiB), the 1 GiB clip payload cap and bounded
+  subscriber/GOP queues guard against memory abuse by local processes.
 
 ---
 
@@ -839,11 +933,12 @@ changes, no new runtime dependencies (jsmn is vendored, single header).
 ## 16. Future work (explicit non-goals of v1)
 
 - `wait_ready` blocking op; `--daemon-list` client command.
-- Frame/event *subscription* streams over IPC (push instead of poll).
+- A device-side request-sync-frame control message (distinct from
+  `RESET_VIDEO`) to avoid replaying a cached GOP after severe client lag.
 - On-demand recording control (`record start/stop`) using the exclusivity
   scaffolding (§14.14).
-- Daemon with a live mirroring window (lift §6.2), including handing the
-  window over between reconnects.
+- An SDL window inside the daemon process itself (mirror mode already provides
+  a separate client window).
 - Unix-domain sockets / named pipes as an optional transport.
 - Token-based auth for multi-user machines.
 - App-launch (`--start-app`), file push, clipboard get/set as protocol ops —

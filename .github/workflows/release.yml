@@ -48,8 +48,8 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: scrcpy-server
-          path: release/work/build-server/server/scrcpy-server
+          name: scrcpy-auto-server
+          path: release/work/build-server/server/scrcpy-auto-server
 
   test-build-scrcpy-server-without-gradle:
     runs-on: ubuntu-latest
@@ -77,7 +77,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y meson ninja-build nasm ffmpeg libavcodec-dev \
-             libavdevice-dev libavformat-dev libavutil-dev libswresample-dev \
+             libavdevice-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
              libusb-1.0-0 libusb-1.0-0-dev libv4l-dev \
              libasound2-dev libpulse-dev \
              libaudio-dev libfribidi-dev libjack-dev libsndio-dev libx11-dev libxext-dev \
@@ -117,7 +117,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y meson ninja-build nasm ffmpeg libavcodec-dev \
-             libavdevice-dev libavformat-dev libavutil-dev libswresample-dev \
+             libavdevice-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
              libusb-1.0-0 libusb-1.0-0-dev libv4l-dev \
              libasound2-dev libpulse-dev \
              libaudio-dev libfribidi-dev libjack-dev libsndio-dev libx11-dev libxext-dev \
@@ -299,7 +299,7 @@ jobs:
       - name: Download scrcpy-server
         uses: actions/download-artifact@v8
         with:
-          name: scrcpy-server
+          name: scrcpy-auto-server
           path: release/work/build-server/server/
 
       - name: Download build-linux-x86_64
@@ -335,7 +335,7 @@ jobs:
       - name: Download scrcpy-server
         uses: actions/download-artifact@v8
         with:
-          name: scrcpy-server
+          name: scrcpy-auto-server
           path: release/work/build-server/server/
 
       - name: Download build-win32
@@ -371,7 +371,7 @@ jobs:
       - name: Download scrcpy-server
         uses: actions/download-artifact@v8
         with:
-          name: scrcpy-server
+          name: scrcpy-auto-server
           path: release/work/build-server/server/
 
       - name: Download build-win64
@@ -407,7 +407,7 @@ jobs:
       - name: Download scrcpy-server
         uses: actions/download-artifact@v8
         with:
-          name: scrcpy-server
+          name: scrcpy-auto-server
           path: release/work/build-server/server/
 
       - name: Download build-macos-aarch64
@@ -443,7 +443,7 @@ jobs:
       - name: Download scrcpy-server
         uses: actions/download-artifact@v8
         with:
-          name: scrcpy-server
+          name: scrcpy-auto-server
           path: release/work/build-server/server/
 
       - name: Download build-macos
@@ -483,7 +483,7 @@ jobs:
       - name: Download scrcpy-server
         uses: actions/download-artifact@v8
         with:
-          name: scrcpy-server
+          name: scrcpy-auto-server
           path: release/work/build-server/server/
 
       - name: Download release-linux-x86_64
@@ -525,5 +525,5 @@ jobs:
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
-          name: scrcpy-release-${{ env.VERSION }}
+          name: scrcpy-auto-release-${{ env.VERSION }}
           path: release/output

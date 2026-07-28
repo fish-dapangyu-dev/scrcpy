@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <signal.h>
+#include <stdatomic.h>
 #ifndef _WIN32
 # include <sys/wait.h>
 # include <time.h>
@@ -27,6 +28,7 @@
 #include "coords.h"
 #include "daemon/addon.h"
 #include "daemon/broadcaster.h"
+#include "daemon/codec.h"
 #include "daemon/clip_buffer.h"
 #include "daemon/frame_keeper.h"
 #include "daemon/protocol.h"
@@ -127,8 +129,8 @@ struct sc_daemon {
     // Test-report platform (DESIGN-test-report.md)
     struct sc_report report;
     bool report_active;      // --auto-test-report was given
-    bool report_initialized; // report dir/log created (once)
-    bool report_recording;   // recorder running this session
+    atomic_bool report_initialized; // report dir/log created (once)
+    atomic_bool report_recording;   // recorder running this session
 
     struct sc_addons addons; // loaded plugins (doc/addons.md)
 
@@ -228,8 +230,10 @@ static void
 sc_daemon_on_demuxer_ended(struct sc_demuxer *demuxer,
                            enum sc_demuxer_status status, void *userdata) {
     (void) demuxer;
-    (void) status;
     struct sc_daemon *d = userdata;
+    if (status == SC_DEMUXER_STATUS_ERROR && d->report_initialized) {
+        sc_report_mark_failed(&d->report);
+    }
     sc_mutex_lock(&d->mutex);
     d->session.dead = true;
     sc_cond_broadcast(&d->cond);
@@ -359,7 +363,7 @@ sc_daemon_session_start(struct sc_daemon *d) {
         .vd_destroy_content = options->vd_destroy_content,
         .vd_system_decorations = options->vd_system_decorations,
         .keep_active = options->keep_active,
-        .flex_display = false,
+        .flex_display = options->flex_display,
         .ignore_video_encoder_constraints =
             options->ignore_video_encoder_constraints,
         .list = 0,
@@ -422,8 +426,9 @@ sc_daemon_session_start(struct sc_daemon *d) {
         if (d->report_active) {
             if (!d->report_initialized) {
                 if (!sc_report_init(&d->report, options->auto_test_report,
-                                    &d->keeper, s->server.serial,
-                                    s->server.info.device_name)) {
+                                    &d->keeper, &d->clips, s->server.serial,
+                                    s->server.info.device_name,
+                                    options->video_codec)) {
                     sc_daemon_session_stop(d);
                     return false;
                 }
@@ -432,6 +437,7 @@ sc_daemon_session_start(struct sc_daemon *d) {
             if (!sc_report_start_recording(&d->report, true,
                                            SC_ORIENTATION_0)) {
                 LOGE("Test report: could not start recording");
+                sc_report_stop_recording(&d->report);
                 sc_daemon_session_stop(d);
                 return false;
             }
@@ -463,6 +469,16 @@ sc_daemon_session_start(struct sc_daemon *d) {
             return false;
         }
         s->controller_started = true;
+
+        if (options->turn_screen_off) {
+            struct sc_control_msg msg = {
+                .type = SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER,
+                .set_display_power.on = false,
+            };
+            if (!sc_controller_push_msg(&s->controller, &msg)) {
+                LOGW("Could not request 'set display power'");
+            }
+        }
     }
 
     // Record device identity for hello/status/registry
@@ -722,7 +738,14 @@ append_status_fields(struct sc_daemon *d, struct sc_strbuf *buf) {
         && sc_strbuf_append_staticstr(buf, "\"serial\":")
         && sc_json_append_escaped(buf, serial)
         && sc_strbuf_append_staticstr(buf, ",\"device_name\":")
-        && sc_json_append_escaped(buf, device_name);
+        && sc_json_append_escaped(buf, device_name)
+        && sc_strbuf_append_staticstr(buf, ",\"video_source\":\"")
+        && sc_strbuf_append_str(buf,
+               d->opts->video_source == SC_VIDEO_SOURCE_CAMERA
+                   ? "camera" : "display")
+        && sc_strbuf_append_staticstr(buf, "\",\"flex_display\":")
+        && sc_strbuf_append_str(buf,
+               d->opts->flex_display ? "true" : "false");
 }
 
 // Append the type keyword for an argument (Unified Plugin Protocol §4).
@@ -837,15 +860,6 @@ release_session(struct sc_daemon *d) {
     sc_mutex_unlock(&d->mutex);
 }
 
-static const char *
-video_codec_name(enum sc_codec codec) {
-    switch (codec) {
-        case SC_CODEC_H265: return "h265";
-        case SC_CODEC_AV1:  return "av1";
-        default:            return "h264";
-    }
-}
-
 // Append ",\"report\":{...}" (the --auto-test-report location and recording
 // state and timeline clocks) and ",\"config\":{...}" (the referenced capture
 // parameters), so --daemon-status is a one-stop readout of how the daemon was
@@ -854,7 +868,7 @@ static bool
 append_status_extras(struct sc_daemon *d, struct sc_strbuf *buf) {
     const struct scrcpy_options *o = d->opts;
 
-    // report: directory + recording.mp4 path + whether recording right now
+    // report: directory + codec-compatible video path + recording state
     // (append_str, not append_staticstr: the ternary is a const char*, not a
     // literal array — sizeof() would give the pointer size)
     bool w = sc_strbuf_append_staticstr(buf, ",\"report\":{\"enabled\":")
@@ -863,7 +877,7 @@ append_status_extras(struct sc_daemon *d, struct sc_strbuf *buf) {
     if (w && o->auto_test_report) {
         int64_t recorded_ms = 0;
         int64_t source_end_ms = 0;
-        sc_frame_keeper_video_time_ms(&d->keeper, &recorded_ms);
+        sc_clip_buffer_timeline_time_ms(&d->clips, &recorded_ms);
         sc_clip_buffer_source_time_ms(&d->clips, &source_end_ms);
         int64_t held_tail_ms = recorded_ms > source_end_ms
                              ? recorded_ms - source_end_ms : 0;
@@ -878,11 +892,18 @@ append_status_extras(struct sc_daemon *d, struct sc_strbuf *buf) {
          && sc_json_append_escaped(buf, o->auto_test_report)
          && sc_strbuf_append_staticstr(buf, ",\"recording\":")
          && sc_strbuf_append_str(buf,
-                d->report_recording ? "true" : "false")
+                d->report_recording && !sc_report_failed(&d->report)
+                    ? "true" : "false")
          && sc_strbuf_append_str(buf, timeline);
         if (w && d->report_initialized && d->report.video_path) {
             w = sc_strbuf_append_staticstr(buf, ",\"video\":")
-             && sc_json_append_escaped(buf, d->report.video_path);
+             && sc_json_append_escaped(buf, d->report.video_path)
+             && sc_strbuf_append_staticstr(buf, ",\"codec\":")
+             && sc_json_append_escaped(buf, d->report.video_codec)
+             && sc_strbuf_append_staticstr(buf, ",\"container\":")
+             && sc_json_append_escaped(buf, d->report.video_container)
+             && sc_strbuf_append_staticstr(buf, ",\"mime_type\":")
+             && sc_json_append_escaped(buf, d->report.video_mime_type);
         }
     }
     w = w && sc_strbuf_append_char(buf, '}');
@@ -898,7 +919,7 @@ append_status_extras(struct sc_daemon *d, struct sc_strbuf *buf) {
         char v[128];
         snprintf(v, sizeof(v),
                  ",\"codec\":\"%s\",\"bit_rate\":%u,\"max_size\":%u",
-                 video_codec_name(o->video_codec), o->video_bit_rate,
+                 sc_daemon_codec_name(o->video_codec), o->video_bit_rate,
                  o->max_size);
         w = sc_strbuf_append_str(buf, v)
          && sc_strbuf_append_staticstr(buf, ",\"max_fps\":")
@@ -1020,9 +1041,9 @@ handle_screencap(struct sc_daemon *d, sc_socket socket, int64_t id,
     int width = frame->width;
     int height = frame->height;
     av_frame_free(&frame);
-    release_session(d);
 
     if (!ok) {
+        release_session(d);
         send_error(socket, id, "E_INTERNAL", "PNG encoding failed");
         return;
     }
@@ -1037,6 +1058,7 @@ handle_screencap(struct sc_daemon *d, sc_socket socket, int64_t id,
         report_log(d, "screencap", action, rextra);
         free(action);
     }
+    release_session(d);
 
     char extra[128];
     snprintf(extra, sizeof(extra),
@@ -1047,18 +1069,25 @@ handle_screencap(struct sc_daemon *d, sc_socket socket, int64_t id,
     free(png);
 }
 
-// Extract [start_ms, end_ms] of the current recording as a standalone MP4
-// (doc/daemon.md §9.5). The clip bytes are returned as the response payload;
-// the CLIENT writes the output file, so this also works remotely and needs no
-// daemon-side write access. The start snaps back to the nearest keyframe.
-// Availability is checked against the report/session wall clock, not the last
-// packet PTS: Android may emit no encoded packet while a frame stays static.
+// Extract [start_ms, end_ms] of the current recording into a
+// codec-compatible container (MP4, or WebM for VP8). The clip bytes are
+// returned as the response payload; the CLIENT writes the output file, so this
+// also works remotely and needs no daemon-side write access. The start snaps
+// back to the nearest keyframe. Availability is checked against the
+// report/session wall clock, not the last packet PTS: Android may emit no
+// encoded packet while a frame stays static.
 static void
 handle_clip(struct sc_daemon *d, sc_socket socket, int64_t id,
             struct sc_json *json) {
     if (!d->opts->video) {
         send_error(socket, id, "E_BAD_REQUEST",
                    "video is disabled (--no-video)");
+        return;
+    }
+    if (d->opts->flex_display) {
+        send_error(socket, id, "E_UNSUPPORTED",
+                   "clip extraction is unavailable for a dynamically resized "
+                   "flex display");
         return;
     }
     int64_t start_ms, end_ms;
@@ -1075,37 +1104,54 @@ handle_clip(struct sc_daemon *d, sc_socket socket, int64_t id,
     }
 
     int64_t recorded_ms;
-    if (!sc_frame_keeper_video_time_ms(&d->keeper, &recorded_ms)) {
+    if (!sc_clip_buffer_timeline_time_ms(&d->clips, &recorded_ms)) {
         release_session(d);
         send_error(socket, id, "E_RANGE", "no video has been recorded yet");
         return;
     }
 
-    uint8_t *mp4;
-    size_t mp4_size;
+    uint8_t *payload;
+    size_t payload_size;
+    const struct sc_clip_format *format;
     int64_t actual_start_ms, actual_end_ms, source_end_ms, held_tail_ms;
     char err[192];
     int r = sc_clip_buffer_extract(&d->clips, start_ms, end_ms, recorded_ms,
-                                   &mp4, &mp4_size, &actual_start_ms,
-                                   &actual_end_ms, &source_end_ms,
-                                   &held_tail_ms, err, sizeof(err));
+                                   &payload, &payload_size, &format,
+                                   &actual_start_ms, &actual_end_ms,
+                                   &source_end_ms, &held_tail_ms, err,
+                                   sizeof(err));
     release_session(d);
     if (r) {
-        send_error(socket, id,
-                   r == SC_CLIP_ERANGE ? "E_RANGE" : "E_INTERNAL", err);
+        const char *code = r == SC_CLIP_ERANGE ? "E_RANGE"
+                         : r == SC_CLIP_ESESSION ? "E_SESSION"
+                         : r == SC_CLIP_ETOOLARGE ? "E_TOO_LARGE"
+                         : "E_INTERNAL";
+        send_error(socket, id, code, err);
         return;
     }
 
-    char extra[256];
+    if (payload_size > SC_DAEMON_MAX_BINARY_PAYLOAD) {
+        av_free(payload);
+        send_error(socket, id, "E_TOO_LARGE",
+                   "clip exceeds the 1 GiB daemon payload limit; split the "
+                   "requested range");
+        return;
+    }
+
+    const char *codec = sc_daemon_codec_name(d->opts->video_codec);
+    char extra[512];
     snprintf(extra, sizeof(extra),
              "\"start_ms\":%" PRId64 ",\"end_ms\":%" PRId64
              ",\"source_end_ms\":%" PRId64
              ",\"held_tail_ms\":%" PRId64
+             ",\"codec\":\"%s\",\"container\":\"%s\""
+             ",\"extension\":\"%s\",\"mime_type\":\"%s\""
              ",\"payload_len\":%zu",
              actual_start_ms, actual_end_ms, source_end_ms, held_tail_ms,
-             mp4_size);
-    send_ok(socket, id, extra, mp4, mp4_size);
-    av_free(mp4);
+             codec, format->container, format->extension, format->mime_type,
+             payload_size);
+    send_ok(socket, id, extra, payload, payload_size);
+    av_free(payload);
 }
 
 static void
@@ -1114,6 +1160,12 @@ handle_control(struct sc_daemon *d, sc_socket socket, int64_t id,
     if (!d->opts->control) {
         send_error(socket, id, "E_BAD_REQUEST",
                    "control is disabled (--no-control)");
+        return;
+    }
+    if (d->opts->video_source == SC_VIDEO_SOURCE_CAMERA) {
+        send_error(socket, id, "E_UNSUPPORTED",
+                   "touch/text control is unavailable for camera capture; "
+                   "use camera_set_torch or camera_zoom_in/camera_zoom_out");
         return;
     }
 
@@ -1225,6 +1277,76 @@ free_cmds:
     }
 }
 
+static void
+handle_device_command(struct sc_daemon *d, sc_socket socket, int64_t id,
+                      enum sc_control_msg_type type, const char *op,
+                      bool display_only) {
+    if (!d->opts->control) {
+        send_error(socket, id, "E_BAD_REQUEST",
+                   "control is disabled (--no-control)");
+        return;
+    }
+    if (display_only
+            && d->opts->video_source == SC_VIDEO_SOURCE_CAMERA) {
+        send_error(socket, id, "E_UNSUPPORTED",
+                   "this command is unavailable for camera capture");
+        return;
+    }
+    if (!acquire_session(d, socket, id)) {
+        return;
+    }
+
+    struct sc_control_msg msg = {
+        .type = type,
+    };
+    bool ok = sc_controller_push_msg(&d->session.controller, &msg);
+    if (ok) {
+        report_log(d, op, NULL, NULL);
+    }
+    release_session(d);
+
+    if (ok) {
+        send_ok(socket, id, NULL, NULL, 0);
+    } else {
+        send_error(socket, id, "E_INTERNAL",
+                   "could not enqueue the device command");
+    }
+}
+
+static void
+handle_set_display_power(struct sc_daemon *d, sc_socket socket, int64_t id,
+                         const struct sc_json *json) {
+    bool on;
+    if (!sc_json_get_bool(json, "on", &on)) {
+        send_error(socket, id, "E_BAD_REQUEST", "expected boolean \"on\"");
+        return;
+    }
+    if (!d->opts->control) {
+        send_error(socket, id, "E_BAD_REQUEST",
+                   "control is disabled (--no-control)");
+        return;
+    }
+    if (!acquire_session(d, socket, id)) {
+        return;
+    }
+
+    struct sc_control_msg msg = {
+        .type = SC_CONTROL_MSG_TYPE_SET_DISPLAY_POWER,
+        .set_display_power.on = on,
+    };
+    bool ok = sc_controller_push_msg(&d->session.controller, &msg);
+    if (ok) {
+        report_log(d, "set_display_power", on ? "on" : "off", NULL);
+    }
+    release_session(d);
+
+    if (ok) {
+        send_ok(socket, id, NULL, NULL, 0);
+    } else {
+        send_error(socket, id, "E_INTERNAL", "could not enqueue event");
+    }
+}
+
 // ---- realtime input injection (single, non-blocking events) ----
 
 static int64_t
@@ -1258,6 +1380,8 @@ parse_motion_action(const struct sc_json *json,
         *out = AMOTION_EVENT_ACTION_UP;
     } else if (!strcmp(s, "move")) {
         *out = AMOTION_EVENT_ACTION_MOVE;
+    } else if (!strcmp(s, "hover_move")) {
+        *out = AMOTION_EVENT_ACTION_HOVER_MOVE;
     } else {
         ok = false;
     }
@@ -1274,7 +1398,93 @@ inject_acquire(struct sc_daemon *d, sc_socket socket, int64_t id) {
                    "control is disabled (--no-control)");
         return false;
     }
+    if (d->opts->video_source == SC_VIDEO_SOURCE_CAMERA) {
+        send_error(socket, id, "E_UNSUPPORTED",
+                   "key/touch/text/scroll injection is unavailable for "
+                   "camera capture");
+        return false;
+    }
     return acquire_session(d, socket, id);
+}
+
+static bool
+camera_acquire(struct sc_daemon *d, sc_socket socket, int64_t id) {
+    if (!d->opts->control) {
+        send_error(socket, id, "E_BAD_REQUEST",
+                   "control is disabled (--no-control)");
+        return false;
+    }
+    if (d->opts->video_source != SC_VIDEO_SOURCE_CAMERA) {
+        send_error(socket, id, "E_UNSUPPORTED",
+                   "camera control requires --video-source=camera");
+        return false;
+    }
+    return acquire_session(d, socket, id);
+}
+
+static void
+reply_push(struct sc_daemon *d, sc_socket socket, int64_t id, bool pushed);
+
+static void
+handle_camera_set_torch(struct sc_daemon *d, sc_socket socket, int64_t id,
+                        const struct sc_json *json) {
+    bool on;
+    if (!sc_json_get_bool(json, "on", &on)) {
+        send_error(socket, id, "E_BAD_REQUEST", "expected boolean \"on\"");
+        return;
+    }
+    if (!camera_acquire(d, socket, id)) {
+        return;
+    }
+    struct sc_control_msg msg = {
+        .type = SC_CONTROL_MSG_TYPE_CAMERA_SET_TORCH,
+        .camera_set_torch = {
+            .on = on,
+        },
+    };
+    reply_push(d, socket, id,
+               sc_controller_push_msg(&d->session.controller, &msg));
+}
+
+static void
+handle_camera_zoom(struct sc_daemon *d, sc_socket socket, int64_t id,
+                   bool zoom_in) {
+    if (!camera_acquire(d, socket, id)) {
+        return;
+    }
+    struct sc_control_msg msg = {
+        .type = zoom_in ? SC_CONTROL_MSG_TYPE_CAMERA_ZOOM_IN
+                        : SC_CONTROL_MSG_TYPE_CAMERA_ZOOM_OUT,
+    };
+    reply_push(d, socket, id,
+               sc_controller_push_msg(&d->session.controller, &msg));
+}
+
+static void
+handle_resize_display(struct sc_daemon *d, sc_socket socket, int64_t id,
+                      const struct sc_json *json) {
+    int64_t width;
+    int64_t height;
+    if (!sc_json_get_int64(json, "width", &width)
+            || !sc_json_get_int64(json, "height", &height)
+            || width <= 0 || width > UINT16_MAX
+            || height <= 0 || height > UINT16_MAX) {
+        send_error(socket, id, "E_BAD_REQUEST",
+                   "expected width/height in 1..65535");
+        return;
+    }
+    if (!d->opts->flex_display) {
+        send_error(socket, id, "E_UNSUPPORTED",
+                   "resize_display requires --flex-display");
+        return;
+    }
+    if (!acquire_session(d, socket, id)) {
+        return;
+    }
+    sc_controller_resize_display(&d->session.controller, (uint16_t) width,
+                                 (uint16_t) height);
+    release_session(d);
+    send_ok(socket, id, NULL, NULL, 0);
 }
 
 static void
@@ -1296,7 +1506,19 @@ handle_inject_touch(struct sc_daemon *d, sc_socket socket, int64_t id,
             || !sc_json_get_int64(json, "x", &x)
             || !sc_json_get_int64(json, "y", &y)) {
         send_error(socket, id, "E_BAD_REQUEST",
-                   "expected action(down|up|move), x, y");
+                   "expected action(down|up|move|hover_move), x, y");
+        return;
+    }
+    int64_t pressure_u16 = json_int_or(
+        json, "pressure_u16",
+        action == AMOTION_EVENT_ACTION_UP ? 0 : UINT16_MAX);
+    int64_t action_button = json_int_or(json, "action_button", 0);
+    int64_t buttons = json_int_or(json, "buttons", 0);
+    if (pressure_u16 < 0 || pressure_u16 > UINT16_MAX
+            || action_button < 0 || action_button > UINT32_MAX
+            || buttons < 0 || buttons > UINT32_MAX) {
+        send_error(socket, id, "E_BAD_REQUEST",
+                   "invalid pressure_u16/action_button/buttons");
         return;
     }
 
@@ -1318,16 +1540,18 @@ handle_inject_touch(struct sc_daemon *d, sc_socket socket, int64_t id,
     struct sc_control_msg msg;
     msg.type = SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
     msg.inject_touch_event.action = action;
-    msg.inject_touch_event.action_button = 0;
+    msg.inject_touch_event.action_button =
+        (enum android_motionevent_buttons) action_button;
     msg.inject_touch_event.buttons =
-        (enum android_motionevent_buttons) json_int_or(json, "buttons", 0);
+        (enum android_motionevent_buttons) buttons;
     msg.inject_touch_event.pointer_id =
         (uint64_t) json_int_or(json, "pointer_id", 0);
     msg.inject_touch_event.position.screen_size = size;
     msg.inject_touch_event.position.point.x = (int32_t) x;
     msg.inject_touch_event.position.point.y = (int32_t) y;
-    msg.inject_touch_event.pressure =
-        action == AMOTION_EVENT_ACTION_UP ? 0.0f : 1.0f;
+    msg.inject_touch_event.pressure = pressure_u16 == UINT16_MAX
+                                    ? 1.0f
+                                    : (float) pressure_u16 / 65536.0f;
 
     reply_push(d, socket, id,
                sc_controller_push_msg(&d->session.controller, &msg));
@@ -1433,7 +1657,8 @@ handle_inject_scroll(struct sc_daemon *d, sc_socket socket, int64_t id,
     msg.inject_scroll_event.position.point.y = (int32_t) y;
     msg.inject_scroll_event.hscroll = (float) json_int_or(json, "hscroll", 0);
     msg.inject_scroll_event.vscroll = (float) json_int_or(json, "vscroll", 0);
-    msg.inject_scroll_event.buttons = 0;
+    msg.inject_scroll_event.buttons =
+        (enum android_motionevent_buttons) json_int_or(json, "buttons", 0);
 
     reply_push(d, socket, id,
                sc_controller_push_msg(&d->session.controller, &msg));
@@ -1726,7 +1951,7 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
     // from the environment instead of shelling back into the client. Empty
     // string / 0 mirrors "unset / server default", as with SC_REPORT_DIR.
     snprintf(e_codec, sizeof(e_codec), "SC_VIDEO_CODEC=%s",
-             o->video ? video_codec_name(o->video_codec) : "");
+             o->video ? sc_daemon_codec_name(o->video_codec) : "");
     snprintf(e_brate, sizeof(e_brate), "SC_VIDEO_BIT_RATE=%u",
              o->video_bit_rate);
     snprintf(e_mfps, sizeof(e_mfps), "SC_VIDEO_MAX_FPS=%s",
@@ -1972,6 +2197,38 @@ handle_request(struct sc_daemon *d, sc_socket socket, const char *json_str,
         handle_inject_text(d, socket, id, &json);
     } else if (!strcmp(op, "inject_scroll")) {
         handle_inject_scroll(d, socket, id, &json);
+    } else if (!strcmp(op, "camera_set_torch")) {
+        handle_camera_set_torch(d, socket, id, &json);
+    } else if (!strcmp(op, "camera_zoom_in")) {
+        handle_camera_zoom(d, socket, id, true);
+    } else if (!strcmp(op, "camera_zoom_out")) {
+        handle_camera_zoom(d, socket, id, false);
+    } else if (!strcmp(op, "resize_display")) {
+        handle_resize_display(d, socket, id, &json);
+    } else if (!strcmp(op, "expand_notification_panel")) {
+        handle_device_command(d, socket, id,
+                              SC_CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL,
+                              op, true);
+    } else if (!strcmp(op, "expand_settings_panel")) {
+        handle_device_command(d, socket, id,
+                              SC_CONTROL_MSG_TYPE_EXPAND_SETTINGS_PANEL,
+                              op, true);
+    } else if (!strcmp(op, "collapse_panels")) {
+        handle_device_command(d, socket, id,
+                              SC_CONTROL_MSG_TYPE_COLLAPSE_PANELS,
+                              op, true);
+    } else if (!strcmp(op, "rotate_device")) {
+        handle_device_command(d, socket, id,
+                              SC_CONTROL_MSG_TYPE_ROTATE_DEVICE, op, true);
+    } else if (!strcmp(op, "open_hard_keyboard_settings")) {
+        handle_device_command(
+            d, socket, id,
+            SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS, op, true);
+    } else if (!strcmp(op, "set_display_power")) {
+        handle_set_display_power(d, socket, id, &json);
+    } else if (!strcmp(op, "reset_video")) {
+        handle_device_command(d, socket, id,
+                              SC_CONTROL_MSG_TYPE_RESET_VIDEO, op, false);
     } else if (!strcmp(op, "note")) {
         handle_note(d, socket, id, &json);
     } else if (!strcmp(op, "plugin")) {
@@ -1988,15 +2245,6 @@ handle_request(struct sc_daemon *d, sc_socket socket, const char *json_str,
             bool ready = d->state == SC_DAEMON_STATE_READY && !d->stop;
             sc_mutex_unlock(&d->mutex);
             if (ready) {
-                // Force a fresh keyframe so a mid-stream subscriber can start
-                // decoding immediately instead of waiting for the device's
-                // next periodic I-frame
-                if (d->opts->control) {
-                    struct sc_control_msg msg = {
-                        .type = SC_CONTROL_MSG_TYPE_RESET_VIDEO,
-                    };
-                    sc_controller_push_msg(&d->session.controller, &msg);
-                }
                 action = SC_CONN_SUBSCRIBE_VIDEO;
             } else {
                 send_error(socket, id, "E_NOT_READY", "session not ready");
@@ -2045,25 +2293,23 @@ run_connection(void *data) {
                 break;
             }
             if (action == SC_CONN_SUBSCRIBE_VIDEO) {
-                // Hand this connection to the video broadcaster: the daemon
-                // now pushes encoded frames on it. Block until the client
-                // closes (recv returns <= 0) or the socket is interrupted
-                // (broadcaster write failure, or daemon shutdown).
+                // Hand this connection to the video broadcaster. This
+                // connection thread drains its own bounded queue; the device
+                // demuxer never performs socket I/O and therefore cannot be
+                // stalled by a slow or abandoned browser.
                 if (!sc_broadcaster_subscribe(&d->broadcaster, socket)) {
                     break;
                 }
-                uint8_t discard[256];
-                while (net_recv(socket, discard, sizeof(discard)) > 0) {
-                    // The bridge does not send on the video channel; drain
-                    // anything unexpected until the socket closes
-                }
+                // The broadcaster caches the latest config/keyframe, so a new
+                // subscriber starts decodably without RESET_VIDEO. Opening or
+                // refreshing a page must not restart the encoder or split the
+                // recording timeline.
+                sc_broadcaster_run(&d->broadcaster, socket);
                 sc_broadcaster_unsubscribe(&d->broadcaster, socket);
                 break;
             }
         }
     }
-
-    net_close(socket);
 
     sc_mutex_lock(&d->mutex);
     // Remove any files this connection uploaded (doc/addons.md §7)
@@ -2073,9 +2319,13 @@ run_connection(void *data) {
         conn->uploads[i] = NULL;
     }
     conn->upload_count = 0;
+    // Publish completion before closing the macOS socket wrapper. Shutdown
+    // checks this flag under the same mutex before calling net_interrupt();
+    // closing first would leave a window where it dereferences freed memory.
     conn->finished = true;
     sc_mutex_unlock(&d->mutex);
 
+    net_close(socket);
     return 0;
 }
 
@@ -2175,15 +2425,24 @@ sc_daemon_interruptible_sleep(struct sc_daemon *d, sc_tick duration) {
 
 // Wait while READY, until the session dies or stop is requested
 static void
-sc_daemon_wait_session_end(struct sc_daemon *d) {
+sc_daemon_wait_session_end(struct sc_daemon *d, sc_tick deadline) {
     sc_mutex_lock(&d->mutex);
     while (!d->stop && !d->session.dead) {
         if (g_stop_signal) {
             d->stop = true;
             break;
         }
-        sc_cond_timedwait(&d->cond, &d->mutex,
-                          sc_tick_now() + SC_DAEMON_WAIT_TICK);
+        sc_tick now = sc_tick_now();
+        if (deadline && now >= deadline) {
+            LOGI("Daemon: time limit reached");
+            d->stop = true;
+            break;
+        }
+        sc_tick wait_deadline = now + SC_DAEMON_WAIT_TICK;
+        if (deadline && wait_deadline > deadline) {
+            wait_deadline = deadline;
+        }
+        sc_cond_timedwait(&d->cond, &d->mutex, wait_deadline);
     }
     sc_mutex_unlock(&d->mutex);
 }
@@ -2219,8 +2478,8 @@ sc_daemon_run(struct scrcpy_options *opts) {
     d->state = SC_DAEMON_STATE_CONNECTING;
     d->start_tick = sc_tick_now();
     d->report_active = opts->auto_test_report != NULL;
-    d->report_initialized = false;
-    d->report_recording = false;
+    atomic_init(&d->report_initialized, false);
+    atomic_init(&d->report_recording, false);
 
     for (unsigned i = 0; i < SC_DAEMON_MAX_CLIENTS; ++i) {
         d->conns[i].plugin_pid = SC_PROCESS_NONE;
@@ -2316,6 +2575,15 @@ sc_daemon_run(struct scrcpy_options *opts) {
                 ret = SCRCPY_EXIT_SUCCESS;
                 break;
             }
+            if (d->report_initialized) {
+                // A report is a single immutable session. Once its files have
+                // been opened (and possibly finalized on a partial startup),
+                // retrying would mix device identities or silently drop
+                // events behind a closed finalization gate.
+                LOGE("Daemon: report session failed before becoming ready; "
+                     "not retrying");
+                break;
+            }
 
             ++failures;
             if (opts->daemon_reconnect_max
@@ -2343,7 +2611,10 @@ sc_daemon_run(struct scrcpy_options *opts) {
         sc_daemon_update_registry(d);
         LOGI("Daemon: device session ready");
 
-        sc_daemon_wait_session_end(d);
+        sc_tick deadline = opts->time_limit
+                         ? sc_tick_now() + opts->time_limit
+                         : 0;
+        sc_daemon_wait_session_end(d, deadline);
 
         sc_mutex_lock(&d->mutex);
         bool stopping = d->stop;
@@ -2386,6 +2657,12 @@ end:
     }
     if (d->accept_thread_started) {
         sc_thread_join(&d->accept_thread, NULL);
+    }
+
+    // Wake subscription writers before joining client connections. They may
+    // be blocked in a socket send or waiting for their next queued frame.
+    if (broadcaster_ok) {
+        sc_broadcaster_interrupt_all(&d->broadcaster);
     }
 
     // Interrupt and join client connections

@@ -9,12 +9,46 @@
 #include <unistd.h>
 #include <libavformat/avformat.h>
 
+#include "compat.h"
+#include "daemon/protocol.h"
 #include "util/log.h"
 
 /** Downcast packet_sink to sc_clip_buffer */
 #define DOWNCAST(SINK) container_of(SINK, struct sc_clip_buffer, packet_sink)
 
 static const AVRational SCRCPY_TIME_BASE = {1, 1000000}; // timestamps in us
+
+static const struct sc_clip_format SC_CLIP_FORMAT_MP4 = {
+    .muxer_name = "mp4",
+    .container = "mp4",
+    .extension = ".mp4",
+    .mime_type = "video/mp4",
+};
+
+static const struct sc_clip_format SC_CLIP_FORMAT_WEBM = {
+    .muxer_name = "webm",
+    .container = "webm",
+    .extension = ".webm",
+    .mime_type = "video/webm",
+};
+
+const struct sc_clip_format *
+sc_clip_format_for_codec(enum AVCodecID codec_id) {
+    switch (codec_id) {
+        case AV_CODEC_ID_VP8:
+            // FFmpeg/upstream scrcpy do not support muxing VP8 into MP4.
+            return &SC_CLIP_FORMAT_WEBM;
+        case AV_CODEC_ID_H264:
+        case AV_CODEC_ID_HEVC:
+#ifdef SCRCPY_LAVC_HAS_AV1
+        case AV_CODEC_ID_AV1:
+#endif
+        case AV_CODEC_ID_VP9:
+            return &SC_CLIP_FORMAT_MP4;
+        default:
+            return NULL;
+    }
+}
 
 // Create an unlinked temporary spool file and return its fd (-1 on error).
 // Unlinking immediately means the file needs no cleanup path: the space is
@@ -43,15 +77,33 @@ reset_locked(struct sc_clip_buffer *cb) {
         cb->fd = -1;
     }
     cb->spool_size = 0;
-    free(cb->config);
-    cb->config = NULL;
-    cb->config_size = 0;
+    for (size_t i = 0; i < cb->epoch_count; ++i) {
+        struct sc_clip_epoch *epoch = &cb->epochs[i];
+        avcodec_parameters_free(&epoch->par);
+        free(epoch->config);
+    }
+    free(cb->epochs);
+    cb->epochs = NULL;
+    cb->epoch_count = 0;
+    cb->epoch_cap = 0;
+    cb->current_epoch = 0;
     free(cb->entries);
     cb->entries = NULL;
     cb->count = 0;
     cb->cap = 0;
-    if (cb->par) {
-        avcodec_parameters_free(&cb->par);
+    cb->first_packet_tick = 0;
+    cb->session_end_tick = 0;
+    cb->failed = false;
+}
+
+static void
+disable_locked(struct sc_clip_buffer *cb, const char *reason) {
+    LOGW("Clip buffer: %s; clips disabled", reason);
+    cb->opened = false;
+    cb->failed = true;
+    if (cb->fd != -1) {
+        close(cb->fd);
+        cb->fd = -1;
     }
 }
 
@@ -64,6 +116,10 @@ sc_clip_buffer_packet_sink_close(struct sc_packet_sink *sink);
 static bool
 sc_clip_buffer_packet_sink_push(struct sc_packet_sink *sink,
                                 const AVPacket *packet);
+static bool
+sc_clip_buffer_packet_sink_push_session(
+        struct sc_packet_sink *sink,
+        const struct sc_stream_session *session);
 
 bool
 sc_clip_buffer_init(struct sc_clip_buffer *cb) {
@@ -74,6 +130,7 @@ sc_clip_buffer_init(struct sc_clip_buffer *cb) {
         .open = sc_clip_buffer_packet_sink_open,
         .close = sc_clip_buffer_packet_sink_close,
         .push = sc_clip_buffer_packet_sink_push,
+        .push_session = sc_clip_buffer_packet_sink_push_session,
     };
     cb->packet_sink.ops = &ops;
 
@@ -99,7 +156,61 @@ sc_clip_buffer_source_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms) {
     return ok;
 }
 
+bool
+sc_clip_buffer_timeline_time_ms(struct sc_clip_buffer *cb, int64_t *out_ms) {
+    sc_mutex_lock(&cb->mutex);
+    bool ok = cb->first_packet_tick != 0;
+    if (ok) {
+        sc_tick end = cb->session_end_tick ? cb->session_end_tick
+                                           : sc_tick_now();
+        *out_ms = SC_TICK_TO_MS(end - cb->first_packet_tick);
+        if (*out_ms < 0) {
+            *out_ms = 0;
+        }
+    }
+    sc_mutex_unlock(&cb->mutex);
+    return ok;
+}
+
 // ---- packet sink trait ------------------------------------------------------
+
+static struct sc_clip_epoch *
+append_epoch_locked(struct sc_clip_buffer *cb,
+                    const AVCodecParameters *source) {
+    AVCodecParameters *par = avcodec_parameters_alloc();
+    if (!par) {
+        LOG_OOM();
+        return NULL;
+    }
+    if (avcodec_parameters_copy(par, source) < 0) {
+        avcodec_parameters_free(&par);
+        return NULL;
+    }
+
+    if (cb->epoch_count == cb->epoch_cap) {
+        size_t cap = cb->epoch_cap ? cb->epoch_cap * 2 : 4;
+        struct sc_clip_epoch *epochs =
+            realloc(cb->epochs, cap * sizeof(*epochs));
+        if (!epochs) {
+            LOG_OOM();
+            avcodec_parameters_free(&par);
+            return NULL;
+        }
+        cb->epochs = epochs;
+        cb->epoch_cap = cap;
+    }
+
+    struct sc_clip_epoch *epoch = &cb->epochs[cb->epoch_count];
+    *epoch = (struct sc_clip_epoch) {
+        .par = par,
+        .config = NULL,
+        .config_size = 0,
+        .first_entry = cb->count,
+    };
+    cb->current_epoch = (uint32_t) cb->epoch_count;
+    ++cb->epoch_count;
+    return epoch;
+}
 
 static bool
 sc_clip_buffer_packet_sink_open(struct sc_packet_sink *sink,
@@ -112,15 +223,18 @@ sc_clip_buffer_packet_sink_open(struct sc_packet_sink *sink,
     // A new stream session (e.g. device reconnect) restarts the buffer: PTS
     // epochs are not comparable across sessions
     reset_locked(cb);
-    cb->par = avcodec_parameters_alloc();
-    if (cb->par && avcodec_parameters_from_context(cb->par, ctx) < 0) {
-        avcodec_parameters_free(&cb->par);
+    AVCodecParameters *initial = avcodec_parameters_alloc();
+    if (initial && avcodec_parameters_from_context(initial, ctx) < 0) {
+        avcodec_parameters_free(&initial);
     }
+    bool epoch_ok = initial && append_epoch_locked(cb, initial);
+    avcodec_parameters_free(&initial);
     cb->fd = create_spool();
-    cb->opened = cb->par && cb->fd != -1;
+    cb->opened = epoch_ok && cb->fd != -1;
     if (!cb->opened) {
         LOGW("Clip buffer: unavailable for this session");
         reset_locked(cb);
+        cb->failed = true;
     }
     sc_mutex_unlock(&cb->mutex);
     // Never fail the demuxer pipeline: without a spool, clip requests will
@@ -128,10 +242,38 @@ sc_clip_buffer_packet_sink_open(struct sc_packet_sink *sink,
     return true;
 }
 
+static bool
+sc_clip_buffer_packet_sink_push_session(
+        struct sc_packet_sink *sink,
+        const struct sc_stream_session *session) {
+    struct sc_clip_buffer *cb = DOWNCAST(sink);
+
+    sc_mutex_lock(&cb->mutex);
+    if (!cb->opened || !cb->epoch_count) {
+        sc_mutex_unlock(&cb->mutex);
+        return true;
+    }
+
+    const struct sc_clip_epoch *previous = &cb->epochs[cb->current_epoch];
+    struct sc_clip_epoch *epoch = append_epoch_locked(cb, previous->par);
+    if (epoch) {
+        epoch->par->width = session->video.width;
+        epoch->par->height = session->video.height;
+    } else {
+        disable_locked(cb, "could not snapshot a new stream session");
+    }
+    sc_mutex_unlock(&cb->mutex);
+    // Clip buffering remains best-effort and must not fail the live stream.
+    return true;
+}
+
 static void
 sc_clip_buffer_packet_sink_close(struct sc_packet_sink *sink) {
     struct sc_clip_buffer *cb = DOWNCAST(sink);
     sc_mutex_lock(&cb->mutex);
+    if (cb->first_packet_tick && !cb->session_end_tick) {
+        cb->session_end_tick = sc_tick_now();
+    }
     // Keep the spool: already-recorded ranges stay clippable until the next
     // session (or daemon exit)
     cb->opened = false;
@@ -144,18 +286,26 @@ sc_clip_buffer_packet_sink_push(struct sc_packet_sink *sink,
     struct sc_clip_buffer *cb = DOWNCAST(sink);
 
     sc_mutex_lock(&cb->mutex);
+    if (packet->pts != AV_NOPTS_VALUE && !cb->first_packet_tick) {
+        cb->first_packet_tick = sc_tick_now();
+    }
     if (!cb->opened || cb->fd == -1) {
         goto out; // spool unavailable: drop silently, never block the stream
     }
 
     if (packet->pts == AV_NOPTS_VALUE) {
         // Config packet (codec extradata); keep the latest one
-        uint8_t *config = malloc(packet->size);
-        if (config) {
-            memcpy(config, packet->data, packet->size);
-            free(cb->config);
-            cb->config = config;
-            cb->config_size = packet->size;
+        uint8_t *config = packet->size ? malloc(packet->size) : NULL;
+        if (!packet->size || config) {
+            if (packet->size) {
+                memcpy(config, packet->data, packet->size);
+            }
+            struct sc_clip_epoch *epoch = &cb->epochs[cb->current_epoch];
+            free(epoch->config);
+            epoch->config = config;
+            epoch->config_size = packet->size;
+        } else {
+            disable_locked(cb, "could not retain codec configuration");
         }
         goto out;
     }
@@ -165,6 +315,7 @@ sc_clip_buffer_packet_sink_push(struct sc_packet_sink *sink,
         struct sc_clip_entry *entries =
             realloc(cb->entries, cap * sizeof(*entries));
         if (!entries) {
+            disable_locked(cb, "could not grow packet index");
             goto out;
         }
         cb->entries = entries;
@@ -175,9 +326,7 @@ sc_clip_buffer_packet_sink_push(struct sc_packet_sink *sink,
                        (off_t) cb->spool_size);
     if (w != packet->size) {
         // Disk full or I/O error: disable the buffer, keep the session alive
-        LOGW("Clip buffer: spool write failed, clips disabled");
-        close(cb->fd);
-        cb->fd = -1;
+        disable_locked(cb, "spool write failed");
         goto out;
     }
 
@@ -185,6 +334,7 @@ sc_clip_buffer_packet_sink_push(struct sc_packet_sink *sink,
     e->pts = packet->pts;
     e->offset = cb->spool_size;
     e->size = packet->size;
+    e->epoch = cb->current_epoch;
     e->key = packet->flags & AV_PKT_FLAG_KEY;
     cb->spool_size += packet->size;
 
@@ -267,6 +417,95 @@ sc_clip_select(const struct sc_clip_entry *entries, size_t count,
     return true;
 }
 
+int
+sc_clip_select_epoch(const struct sc_clip_entry *entries, size_t count,
+                     int64_t start_us, int64_t end_us, size_t *begin,
+                     size_t *stop, int64_t *boundary_us) {
+    if (!count || start_us >= end_us) {
+        return SC_CLIP_ERANGE;
+    }
+
+    ssize_t last = last_before(entries, count, end_us);
+    if (last < 0) {
+        return SC_CLIP_ERANGE;
+    }
+
+    uint32_t epoch = entries[last].epoch;
+    size_t epoch_first = (size_t) last;
+    while (epoch_first && entries[epoch_first - 1].epoch == epoch) {
+        --epoch_first;
+    }
+
+    // One muxed stream cannot change codec parameters halfway through. Both
+    // sides remain independently extractable with their original timestamps.
+    if (epoch_first && start_us < entries[epoch_first].pts
+            // Public clip coordinates are integer milliseconds. Permit the
+            // caller to restart at the millisecond bucket containing a
+            // sub-millisecond epoch boundary; selection still snaps forward
+            // to that epoch's first keyframe, so no packet crosses sessions.
+            && entries[epoch_first].pts - start_us >= 1000) {
+        if (boundary_us) {
+            *boundary_us = entries[epoch_first].pts;
+        }
+        return SC_CLIP_ESESSION;
+    }
+
+    size_t local_begin;
+    size_t local_stop;
+    if (!sc_clip_select(&entries[epoch_first],
+                        (size_t) last - epoch_first + 1,
+                        start_us, end_us, &local_begin, &local_stop)) {
+        return SC_CLIP_ERANGE;
+    }
+
+    *begin = epoch_first + local_begin;
+    *stop = epoch_first + local_stop;
+    return 0;
+}
+
+static bool
+buffer_equal(const uint8_t *a, size_t a_size, const uint8_t *b,
+             size_t b_size) {
+    return a_size == b_size
+        && (!a_size || !memcmp(a, b, a_size));
+}
+
+static bool
+codec_parameters_compatible(const AVCodecParameters *a,
+                            const AVCodecParameters *b) {
+    // Compare every codec/geometry/color field which describes how samples in
+    // one muxed video track must be interpreted. Bit rate and padding are not
+    // decoder configuration and may legitimately vary across an encoder
+    // restart.
+    return a && b
+        && a->codec_type == b->codec_type
+        && a->codec_id == b->codec_id
+        && a->codec_tag == b->codec_tag
+        && a->format == b->format
+        && a->profile == b->profile
+        && a->level == b->level
+        && a->width == b->width
+        && a->height == b->height
+        && a->sample_aspect_ratio.num == b->sample_aspect_ratio.num
+        && a->sample_aspect_ratio.den == b->sample_aspect_ratio.den
+        && a->field_order == b->field_order
+        && a->color_range == b->color_range
+        && a->color_primaries == b->color_primaries
+        && a->color_trc == b->color_trc
+        && a->color_space == b->color_space
+        && a->chroma_location == b->chroma_location
+        && buffer_equal(a->extradata, a->extradata_size,
+                        b->extradata, b->extradata_size);
+}
+
+static bool
+epochs_compatible(const struct sc_clip_epoch *a,
+                  const struct sc_clip_epoch *b) {
+    return codec_parameters_compatible(a->par, b->par)
+        && buffer_equal(a->config, a->config_size,
+                        b->config, b->config_size);
+}
+
 // ---- extraction -------------------------------------------------------------
 
 static int64_t
@@ -283,23 +522,32 @@ sc_clip_packet_duration_us(const struct sc_clip_entry *entries, size_t count,
                            size_t index, int64_t end_us) {
     return packet_duration_us(entries, count, index, end_us);
 }
+
+bool
+sc_clip_epochs_compatible(const struct sc_clip_epoch *a,
+                          const struct sc_clip_epoch *b) {
+    return epochs_compatible(a, b);
+}
 #endif
 
 static int
-mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
-            size_t count, const uint8_t *config, size_t config_size,
-            int64_t end_us, uint8_t **out, size_t *out_size) {
+mux_entries(int spool_fd, const AVCodecParameters *par,
+            const struct sc_clip_entry *entries, size_t count,
+            const uint8_t *config, size_t config_size, int64_t end_us,
+            const struct sc_clip_format *format, uint8_t **out,
+            size_t *out_size) {
     int ret = SC_CLIP_EINTERNAL;
     AVFormatContext *ctx = NULL;
     AVPacket *packet = NULL;
     bool header_written = false;
 
-    if (avformat_alloc_output_context2(&ctx, NULL, "mp4", NULL) < 0) {
+    if (avformat_alloc_output_context2(&ctx, NULL, format->muxer_name,
+                                       NULL) < 0) {
         return SC_CLIP_EINTERNAL;
     }
 
     AVStream *stream = avformat_new_stream(ctx, NULL);
-    if (!stream || avcodec_parameters_copy(stream->codecpar, cb->par) < 0) {
+    if (!stream || avcodec_parameters_copy(stream->codecpar, par) < 0) {
         goto end;
     }
     if (config_size) { // codec extradata comes from the config packet
@@ -321,6 +569,10 @@ mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
     if (avformat_write_header(ctx, NULL) < 0) {
         goto end;
     }
+    if (avio_tell(ctx->pb) > (int64_t) SC_DAEMON_MAX_BINARY_PAYLOAD) {
+        ret = SC_CLIP_ETOOLARGE;
+        goto end;
+    }
     header_written = true;
 
     packet = av_packet_alloc();
@@ -335,7 +587,7 @@ mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
         if (!data) {
             goto end;
         }
-        ssize_t r = pread(cb->fd, data, e->size, (off_t) e->offset);
+        ssize_t r = pread(spool_fd, data, e->size, (off_t) e->offset);
         if (r != (ssize_t) e->size) {
             av_free(data);
             goto end;
@@ -364,12 +616,20 @@ mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
         if (w < 0) {
             goto end;
         }
+        if (avio_tell(ctx->pb) > (int64_t) SC_DAEMON_MAX_BINARY_PAYLOAD) {
+            ret = SC_CLIP_ETOOLARGE;
+            goto end;
+        }
     }
 
     if (av_write_trailer(ctx) < 0) {
         goto end;
     }
     header_written = false;
+    if (avio_tell(ctx->pb) > (int64_t) SC_DAEMON_MAX_BINARY_PAYLOAD) {
+        ret = SC_CLIP_ETOOLARGE;
+        goto end;
+    }
 
     int size = avio_close_dyn_buf(ctx->pb, out);
     ctx->pb = NULL;
@@ -382,7 +642,7 @@ mux_entries(struct sc_clip_buffer *cb, const struct sc_clip_entry *entries,
 end:
     av_packet_free(&packet);
     if (ctx) {
-        if (header_written) {
+        if (header_written && ret != SC_CLIP_ETOOLARGE) {
             av_write_trailer(ctx);
         }
         if (ctx->pb) {
@@ -400,6 +660,7 @@ int
 sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
                        int64_t end_ms, int64_t available_end_ms,
                        uint8_t **out, size_t *out_size,
+                       const struct sc_clip_format **out_format,
                        int64_t *actual_start_ms, int64_t *actual_end_ms,
                        int64_t *source_end_ms, int64_t *held_tail_ms,
                        char *errbuf, size_t errbuf_size) {
@@ -407,7 +668,14 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
 
     sc_mutex_lock(&cb->mutex);
 
-    if (cb->fd == -1 || !cb->count || !cb->par) {
+    if (cb->failed) {
+        snprintf(errbuf, errbuf_size,
+                 "clip buffer failed during recording; extraction is "
+                 "unavailable");
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_EINTERNAL;
+    }
+    if (cb->fd == -1 || !cb->count || !cb->epoch_count) {
         snprintf(errbuf, errbuf_size, "no video has been recorded yet");
         sc_mutex_unlock(&cb->mutex);
         return SC_CLIP_ERANGE;
@@ -427,43 +695,147 @@ sc_clip_buffer_extract(struct sc_clip_buffer *cb, int64_t start_ms,
     int64_t start_us = first + start_ms * 1000;
     int64_t end_us = first + end_ms * 1000;
 
-    size_t begin, stop;
-    if (!sc_clip_select(cb->entries, cb->count, start_us, end_us,
-                        &begin, &stop)) {
+    size_t begin;
+    size_t stop;
+    int64_t boundary_us = 0;
+    int select_ret =
+        sc_clip_select_epoch(cb->entries, cb->count, start_us, end_us,
+                             &begin, &stop, &boundary_us);
+    if (select_ret == SC_CLIP_ESESSION) {
+        // A keyframe-only encoder refresh (for example an explicit freshness
+        // reset) is transparent when codec parameters and config are exactly
+        // unchanged. Geometry/config changes remain hard boundaries.
+        if (!sc_clip_select(cb->entries, cb->count, start_us, end_us,
+                            &begin, &stop)) {
+            select_ret = SC_CLIP_ERANGE;
+        } else {
+            select_ret = 0;
+            uint32_t previous_index = cb->entries[begin].epoch;
+            if (previous_index >= cb->epoch_count) {
+                select_ret = SC_CLIP_EINTERNAL;
+            }
+            for (size_t i = begin + 1; !select_ret && i <= stop; ++i) {
+                uint32_t current_index = cb->entries[i].epoch;
+                if (current_index == previous_index) {
+                    continue;
+                }
+                if (current_index >= cb->epoch_count
+                        || !epochs_compatible(&cb->epochs[previous_index],
+                                              &cb->epochs[current_index])) {
+                    boundary_us = cb->entries[i].pts;
+                    select_ret = SC_CLIP_ESESSION;
+                    break;
+                }
+                previous_index = current_index;
+            }
+        }
+    }
+    if (select_ret == SC_CLIP_ESESSION) {
+        int64_t boundary_ms = (boundary_us - first) / 1000;
+        snprintf(errbuf, errbuf_size,
+                 "clip crosses an incompatible codec/geometry boundary at "
+                 "%" PRId64 ".%03" PRId64
+                 "s; split the request at that boundary",
+                 boundary_ms / 1000, boundary_ms % 1000);
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_ESESSION;
+    }
+    if (select_ret == SC_CLIP_EINTERNAL) {
+        snprintf(errbuf, errbuf_size, "invalid video session index");
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_EINTERNAL;
+    }
+    if (select_ret) {
         snprintf(errbuf, errbuf_size, "no video packets in the requested "
                                       "range");
         sc_mutex_unlock(&cb->mutex);
         return SC_CLIP_ERANGE;
     }
 
-    // Snapshot the selected index slice and the config packet, then release
-    // the lock: spool data is append-only, so the slice is immutable and the
-    // (slow) muxing must not stall the demuxer
+    uint32_t epoch_index = cb->entries[begin].epoch;
+    if (epoch_index >= cb->epoch_count) {
+        snprintf(errbuf, errbuf_size, "invalid video session index");
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_EINTERNAL;
+    }
+    const struct sc_clip_epoch *epoch = &cb->epochs[epoch_index];
+    const struct sc_clip_format *format =
+        sc_clip_format_for_codec(epoch->par->codec_id);
+    if (!format) {
+        snprintf(errbuf, errbuf_size, "unsupported video codec id %d",
+                 epoch->par->codec_id);
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_EINTERNAL;
+    }
+
+    // Reject only when the raw encoded payload itself already exceeds the
+    // protocol bound. Container overhead is format-dependent, so the exact
+    // limit is enforced below while muxing instead of pessimistically
+    // rejecting a clip whose actual output would fit.
+    size_t raw_size = epoch->config_size;
+    if (raw_size > SC_DAEMON_MAX_BINARY_PAYLOAD) {
+        snprintf(errbuf, errbuf_size,
+                 "clip exceeds the 1 GiB daemon payload limit; split the "
+                 "requested range");
+        sc_mutex_unlock(&cb->mutex);
+        return SC_CLIP_ETOOLARGE;
+    }
+    for (size_t i = begin; i <= stop; ++i) {
+        size_t packet_size = cb->entries[i].size;
+        if (packet_size > SC_DAEMON_MAX_BINARY_PAYLOAD - raw_size) {
+            snprintf(errbuf, errbuf_size,
+                     "clip exceeds the 1 GiB daemon payload limit; split the "
+                     "requested range");
+            sc_mutex_unlock(&cb->mutex);
+            return SC_CLIP_ETOOLARGE;
+        }
+        raw_size += packet_size;
+    }
+
+    // Snapshot the selected slice, epoch parameters/config and the spool fd,
+    // then release the lock. dup() keeps this exact unlinked spool alive even
+    // if a reconnect resets the buffer while muxing.
     size_t n = stop - begin + 1;
     struct sc_clip_entry *slice = malloc(n * sizeof(*slice));
     uint8_t *config = NULL;
-    size_t config_size = cb->config_size;
+    size_t config_size = epoch->config_size;
     if (config_size) {
         config = malloc(config_size);
     }
-    if (!slice || (config_size && !config)) {
+    AVCodecParameters *par = avcodec_parameters_alloc();
+    bool par_ok = par && avcodec_parameters_copy(par, epoch->par) >= 0;
+    int spool_fd = dup(cb->fd);
+    if (!slice || (config_size && !config) || !par_ok || spool_fd == -1) {
         free(slice);
         free(config);
-        snprintf(errbuf, errbuf_size, "out of memory");
+        avcodec_parameters_free(&par);
+        if (spool_fd != -1) {
+            close(spool_fd);
+        }
+        snprintf(errbuf, errbuf_size, "could not snapshot the video buffer");
         sc_mutex_unlock(&cb->mutex);
         return SC_CLIP_EINTERNAL;
     }
     memcpy(slice, &cb->entries[begin], n * sizeof(*slice));
     if (config_size) {
-        memcpy(config, cb->config, config_size);
+        memcpy(config, epoch->config, config_size);
     }
     sc_mutex_unlock(&cb->mutex);
 
-    int ret = mux_entries(cb, slice, n, config, config_size, end_us, out,
-                          out_size);
+    int ret = mux_entries(spool_fd, par, slice, n, config, config_size, end_us,
+                          format, out, out_size);
+    close(spool_fd);
+    avcodec_parameters_free(&par);
     if (ret) {
-        snprintf(errbuf, errbuf_size, "could not mux the clip");
+        if (ret == SC_CLIP_ETOOLARGE) {
+            snprintf(errbuf, errbuf_size,
+                     "clip exceeds the 1 GiB daemon payload limit; split the "
+                     "requested range");
+        } else {
+            snprintf(errbuf, errbuf_size, "could not mux the clip");
+        }
     } else {
+        *out_format = format;
         *actual_start_ms = (slice[0].pts - first) / 1000;
         *actual_end_ms = end_ms;
         *source_end_ms = (slice[n - 1].pts - first) / 1000;

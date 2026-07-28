@@ -21,6 +21,8 @@ enum sc_record_format {
     SC_RECORD_FORMAT_AUTO,
     SC_RECORD_FORMAT_MP4,
     SC_RECORD_FORMAT_MKV,
+    // Internal daemon-report format for browser-playable VP8 recordings.
+    SC_RECORD_FORMAT_WEBM,
     SC_RECORD_FORMAT_M4A,
     SC_RECORD_FORMAT_MKA,
     SC_RECORD_FORMAT_OPUS,

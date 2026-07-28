@@ -15,10 +15,19 @@
 //     named args ("arg_names"/"arg_values") beyond the primary value.
 // v3: hello plugin schema is keyed ("name|key=value|..."); plugin op response
 //     carries a "result" object; new "upload" op for remote byte transfer.
-#define SC_DAEMON_PROTOCOL_VERSION 3
+// v4: the video stream supports all scrcpy 4.1 codecs; VP8/VP9 may start
+//     without a config packet; clip responses declare codec/container/MIME
+//     and use WebM for VP8 instead of pretending every payload is MP4.
+#define SC_DAEMON_PROTOCOL_VERSION 4
 
-// Sanity cap for a frame (JSON document or binary payload)
+// Sanity cap for JSON documents and individual realtime/upload packets.
 #define SC_DAEMON_MAX_FRAME_SIZE (64 * 1024 * 1024) // 64 MiB
+
+// Clip responses may legitimately exceed 64 MiB (for example, >67 seconds at
+// 8 Mbit/s). They still have an explicit bound so a malformed peer cannot
+// request an unbounded allocation. JSON and realtime video retain the tighter
+// frame limit above.
+#define SC_DAEMON_MAX_BINARY_PAYLOAD ((size_t) 1024 * 1024 * 1024) // 1 GiB
 
 #define SC_DAEMON_MAX_JSON_TOKENS 128
 
@@ -58,7 +67,8 @@ sc_daemon_write_frame(sc_socket socket, const char *json, size_t json_len,
                       const uint8_t *payload, size_t payload_len);
 
 /**
- * Read exactly `len` payload bytes into a malloc'd buffer.
+ * Read exactly `len` payload bytes into a malloc'd buffer, up to
+ * SC_DAEMON_MAX_BINARY_PAYLOAD.
  */
 bool
 sc_daemon_read_payload(sc_socket socket, size_t len, uint8_t **out_data);
