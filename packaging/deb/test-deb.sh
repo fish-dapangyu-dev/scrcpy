@@ -43,8 +43,16 @@ docker run --rm --network none \
         echo; echo "== server present =="
         ls -l /usr/share/scrcpy-auto/
 
-        echo; echo "== adb =="
-        if command -v adb >/dev/null; then adb version | head -n1 || true; else echo "(adb not bundled)"; fi
+        echo; echo "== adb is not bundled =="
+        if dpkg -L scrcpy-auto | grep -Eq "/(usr/)?(lib/[^/]+/)?adb$"; then
+            echo "ERROR: package unexpectedly bundles adb" >&2
+            exit 1
+        fi
+        if command -v adb >/dev/null; then
+            echo "ERROR: clean image unexpectedly gained adb" >&2
+            exit 1
+        fi
+        echo "OK: install uses the host adb from PATH/ADB when available"
 
         echo; echo "== purge (clean removal) =="
         dpkg -r scrcpy-auto >/dev/null && echo "removed cleanly"

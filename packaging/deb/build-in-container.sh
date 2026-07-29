@@ -7,15 +7,15 @@
 # but can be run directly inside any Ubuntu 24.04 environment with internet.
 #
 # Strategy: statically link the heavy media deps (FFmpeg + SDL3 + dav1d + libusb)
-# into the client binary, then bundle the Android server and adb. The resulting
-# package depends only on base-image libraries, so `dpkg -i` succeeds on an
-# offline host.
+# into the client binary, then bundle the Android server. The resulting package
+# depends only on base-image libraries, so `dpkg -i` succeeds on an offline
+# host. adb is intentionally never bundled; the client uses adb from PATH (or
+# the ADB environment variable) so it cannot conflict with the host adb server.
 #
 # Inputs (env):
 #   SRC          source tree mount (read-only)      default /src
 #   OUT          output dir for the .deb            default /out
 #   SERVER_MODE  prebuilt | none | path:/abs/file   default prebuilt
-#   BUNDLE_ADB   1 to bundle adb, 0 to skip         default 1
 #   DEB_VERSION  override the package version        default <meson version>-1
 set -euo pipefail
 
@@ -23,13 +23,12 @@ SRC=${SRC:-/src}
 OUT=${OUT:-/out}
 BUILD=${BUILD:-/build}
 SERVER_MODE=${SERVER_MODE:-prebuilt}
-BUNDLE_ADB=${BUNDLE_ADB:-1}
 JOBS=$(nproc)
 
-# Pinned upstream v4.0 server (server/src is byte-for-byte upstream in this fork,
+# Pinned upstream v4.1 server (server/src is byte-for-byte upstream in this fork,
 # so the official prebuilt is functionally identical; we only rename it).
-PREBUILT_SERVER_URL=https://github.com/Genymobile/scrcpy/releases/download/v4.0/scrcpy-server-v4.0
-PREBUILT_SERVER_SHA256=84924bd564a1eb6089c872c7521f968058977f91f5ff02514a8c74aff3210f3a
+PREBUILT_SERVER_URL=https://github.com/Genymobile/scrcpy/releases/download/v4.1/scrcpy-server-v4.1
+PREBUILT_SERVER_SHA256=deacb991ed2509715160ffdc7907e47b4160eb30d1566217e9047fd5b8850cae
 
 log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
@@ -91,13 +90,9 @@ cd app/deps
 ./dav1d.sh linux native static
 ./ffmpeg.sh linux native static
 ./libusb.sh linux native static
-if [[ "$BUNDLE_ADB" == 1 ]]; then
-    ./adb_linux.sh linux native static
-fi
 cd "$BUILD"
 
 DEPS="$BUILD/app/deps/work/install/linux-native-static"
-ADBDIR="$BUILD/app/deps/work/install/adb-linux"
 
 ########################################
 log "Configuring and building the client"
@@ -171,14 +166,6 @@ if [[ "$SERVER_MODE" != none ]]; then
 fi
 
 ########################################
-log "Bundling adb"
-########################################
-if [[ "$BUNDLE_ADB" == 1 ]]; then
-    install -d "$STAGE/usr/lib/scrcpy-auto"
-    install -m 0755 "$ADBDIR/adb" "$STAGE/usr/lib/scrcpy-auto/adb"
-fi
-
-########################################
 log "Computing dependencies and writing package metadata"
 ########################################
 mkdir -p "$STAGE/DEBIAN"
@@ -213,6 +200,7 @@ Priority: optional
 Installed-Size: $INSTALLED_SIZE
 Depends: $DEPENDS
 Recommends: libgl1, libegl1, libx11-6, libxext6, libwayland-client0, libxkbcommon0, libpulse0, libasound2t64
+Suggests: adb
 Homepage: https://github.com/Genymobile/scrcpy
 Description: Display and control Android devices (scrcpy-auto automation fork)
  scrcpy-auto is an automation-focused fork of scrcpy that adds a daemon mode,
@@ -220,33 +208,11 @@ Description: Display and control Android devices (scrcpy-auto automation fork)
  mirroring.
  .
  This build statically links FFmpeg (with swscale + PNG), SDL3, dav1d and
- libusb into the client, and bundles a prebuilt Android server and adb, so it
- installs and runs on an offline host with no additional packages. The
+ libusb into the client, and bundles a prebuilt Android server, so it installs
+ on an offline host with no additional packages. adb is intentionally not
+ bundled: install the system adb package before connecting a device. The
  Recommends are only needed for on-screen mirroring on a desktop session.
 EOF
-
-# Maintainer scripts: provide adb on PATH without clobbering an existing adb.
-if [[ "$BUNDLE_ADB" == 1 ]]; then
-    cat > "$STAGE/DEBIAN/postinst" <<'EOF'
-#!/bin/sh
-set -e
-if [ "$1" = configure ]; then
-    if [ ! -e /usr/bin/adb ]; then
-        ln -s /usr/lib/scrcpy-auto/adb /usr/bin/adb
-    fi
-fi
-exit 0
-EOF
-    cat > "$STAGE/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
-set -e
-if [ -L /usr/bin/adb ] && [ "$(readlink /usr/bin/adb)" = /usr/lib/scrcpy-auto/adb ]; then
-    rm -f /usr/bin/adb
-fi
-exit 0
-EOF
-    chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/prerm"
-fi
 
 ########################################
 log "Building the .deb"

@@ -1,4 +1,4 @@
-name: Publish macOS binaries
+name: Publish Linux and macOS binaries
 
 on:
   workflow_dispatch:
@@ -86,10 +86,40 @@ jobs:
           name: build-macos-${{ matrix.arch }}-intermediate
           path: release/work/build-macos-${{ matrix.arch }}/dist-tar/
 
+  build-linux-deb:
+    needs:
+      - build-scrcpy-server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Download server
+        uses: actions/download-artifact@v8
+        with:
+          name: scrcpy-auto-server
+          path: release/work/build-server/server/
+
+      - name: Build and test Debian package
+        run: |
+          deb_version="${VERSION#v}"
+          packaging/deb/build-deb.sh \
+              --output "$PWD/release/output" \
+              --server "$PWD/release/work/build-server/server/scrcpy-auto-server" \
+              --version "$deb_version" \
+              --test
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-linux-deb-intermediate
+          path: release/output/*.deb
+
   publish:
     needs:
       - build-scrcpy-server
       - build-macos
+      - build-linux-deb
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -112,6 +142,12 @@ jobs:
         with:
           name: build-macos-x86_64-intermediate
           path: release/work/build-macos-x86_64/dist-tar/
+
+      - name: Download Linux Debian package
+        uses: actions/download-artifact@v8
+        with:
+          name: build-linux-deb-intermediate
+          path: release/output/
 
       - name: Package arm64 client and server
         run: |
@@ -137,13 +173,22 @@ jobs:
               "scrcpy-auto-macos-x86_64-$VERSION.tar.gz" \
               > SHA256SUMS-macos.txt
 
+      - name: Generate all-platform checksums
+        run: |
+          cd release/output
+          sha256sum \
+              "scrcpy-auto_${VERSION#v}_amd64.deb" \
+              "scrcpy-auto-macos-arm64-$VERSION.tar.gz" \
+              "scrcpy-auto-macos-x86_64-$VERSION.tar.gz" \
+              > SHA256SUMS.txt
+
       - name: Stage installer
         run: cp install.sh release/output/install.sh
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:
-          name: scrcpy-auto-macos-${{ env.VERSION }}
+          name: scrcpy-auto-release-${{ env.VERSION }}
           path: release/output/
 
       - name: Publish GitHub release
