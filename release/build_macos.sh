@@ -11,6 +11,32 @@ then
 fi
 
 ARCH="$1"
+
+case "$ARCH" in
+    arm64)
+        EXPECTED_HOST_ARCH=arm64
+        DEFAULT_DEPLOYMENT_TARGET=11.0
+        ;;
+    x86_64)
+        EXPECTED_HOST_ARCH=x86_64
+        DEFAULT_DEPLOYMENT_TARGET=10.13
+        ;;
+    *)
+        echo "Unsupported macOS architecture: $ARCH (expected arm64 or x86_64)" >&2
+        exit 1
+        ;;
+esac
+
+HOST_ARCH="$(uname -m)"
+if [[ "$HOST_ARCH" != "$EXPECTED_HOST_ARCH" ]]
+then
+    echo "Cannot label a $HOST_ARCH build as $ARCH" >&2
+    exit 1
+fi
+
+: "${MACOSX_DEPLOYMENT_TARGET:=$DEFAULT_DEPLOYMENT_TARGET}"
+export MACOSX_DEPLOYMENT_TARGET
+
 MACOS_BUILD_DIR="$WORK_DIR/build-macos-$ARCH"
 
 app/deps/adb_macos.sh
@@ -46,3 +72,16 @@ cp app/data/scrcpy-auto-disconnected.png "$MACOS_BUILD_DIR/dist/"
 cp app/scrcpy-auto.1 "$MACOS_BUILD_DIR/dist/"
 cp LICENSE "$MACOS_BUILD_DIR/dist"
 cp -r "$ADB_INSTALL_DIR"/. "$MACOS_BUILD_DIR/dist/"
+
+# Apple Silicon requires a valid code signature. An ad-hoc signature is enough
+# for a command-line binary distributed through Homebrew, and also makes the
+# archive runnable when it is downloaded directly.
+codesign --force --sign - "$MACOS_BUILD_DIR/dist/scrcpy-auto"
+codesign --verify --strict "$MACOS_BUILD_DIR/dist/scrcpy-auto"
+
+BUILT_ARCHS="$(lipo -archs "$MACOS_BUILD_DIR/dist/scrcpy-auto")"
+if [[ "$BUILT_ARCHS" != "$ARCH" ]]
+then
+    echo "Unexpected binary architecture: $BUILT_ARCHS (expected $ARCH)" >&2
+    exit 1
+fi
