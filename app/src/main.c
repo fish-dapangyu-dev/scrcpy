@@ -22,6 +22,7 @@
 #include "util/log.h"
 #include "util/net.h"
 #include "util/term.h"
+#include "user_config.h"
 #include "version.h"
 
 #ifdef _WIN32
@@ -162,6 +163,11 @@ end:
 int
 main(int argc, char *argv[]) {
 #ifndef _WIN32
+    // Package installation may run as root or in a sandbox, so it cannot
+    // safely initialize a per-user directory. Ensure it for the actual user
+    // before dispatching any command instead.
+    (void) sc_user_config_ensure_dir();
+
     if (argc >= 2 && (!strcmp(argv[1], "plugins-install")
                       || !strcmp(argv[1], "plugins-upgrade"))) {
         return sc_plugins_cli(argc, argv);

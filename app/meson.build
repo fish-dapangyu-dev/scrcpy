@@ -49,6 +49,7 @@ src = [
     'src/sdl_hints.c',
     'src/server.c',
     'src/texture.c',
+    'src/user_config.c',
     'src/version.c',
     'src/video_regulator.c',
     'src/hid/hid_gamepad.c',
@@ -206,11 +207,11 @@ configure_file(configuration: conf, output: 'config.h')
 
 src_dir = include_directories('src')
 
-executable('scrcpy-auto', src,
-           dependencies: dependencies,
-           include_directories: src_dir,
-           install: true,
-           c_args: [])
+scrcpy_exe = executable('scrcpy-auto', src,
+                        dependencies: dependencies,
+                        include_directories: src_dir,
+                        install: true,
+                        c_args: [])
 
 # <https://mesonbuild.com/Builtin-options.html#directories>
 datadir = get_option('datadir') # by default 'share'
@@ -364,6 +365,21 @@ if get_option('buildtype') == 'debug'
             'tests/test_vector.c',
         ]],
     ]
+
+    if host_machine.system() != 'windows'
+        tests += [['test_user_config', [
+            'tests/test_user_config.c',
+            'src/user_config.c',
+        ]]]
+
+        test('test_user_config_startup',
+             find_program('sh'),
+             args: [
+                 join_paths(meson.current_source_dir(),
+                            'tests/test_user_config_startup.sh'),
+                 scrcpy_exe,
+             ])
+    endif
 
     foreach t : tests
         sources = t[1] + ['src/compat.c']

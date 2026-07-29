@@ -159,7 +159,8 @@ app/data/bash-completion/scrcpy-auto, app/data/zsh-completion/_scrcpy-auto
 | `app/src/options.c` | defaults for the fields above |
 | `app/src/events.h` | `SC_EVENT_SCREENCAP_COMPLETED`, `SC_EVENT_SCREENCAP_ERROR` |
 | `app/src/scrcpy.c` | includes `control_exec.h`/`screencap.h`; screencap init/wiring/cleanup (search `screencap`); the `--control` execution block before `event_loop()` (calls `sc_control_exec_run(..., 1)`) |
-| `app/src/main.c` | daemon/client routing between `sc_log_configure()` and `sc_main_thread_init()`; the client branch dispatches `opts->mirror` → `sc_mirror_run()` (wrapped in `sc_main_thread_init/destroy`) vs `sc_client_run()` |
+| `app/src/main.c` | per-user `~/.scrcpy-auto` initialization before command dispatch; daemon/client routing between `sc_log_configure()` and `sc_main_thread_init()`; the client branch dispatches `opts->mirror` → `sc_mirror_run()` (wrapped in `sc_main_thread_init/destroy`) vs `sc_client_run()` |
+| `app/src/user_config.{c,h}` | idempotent Unix startup initialization of the current user's private `~/.scrcpy-auto` directory |
 | `app/src/util/net.{c,h}` | additive `net_local_port()` (getsockname helper) — used by mirror mode to find the ephemeral port of its loopback socket pairs |
 | `app/src/trait/packet_source.h` | `SC_PACKET_SOURCE_MAX_SINKS` 2 → **4** (decoder + broadcaster + clip buffer + recorder) |
 | `app/src/recorder.c` | internal WebM muxer mapping used by VP8 auto-test reports; explicit first-retained-frame media origin drops preroll and requires the first recorded packet to hit that origin exactly as a keyframe |

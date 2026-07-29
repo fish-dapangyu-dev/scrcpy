@@ -10,6 +10,12 @@ Installed plugins live under a fixed directory, one sub-directory each:
 
     ~/.scrcpy-auto/plugins/<name>/
 
+On Unix-like systems, the first `scrcpy-auto` command run by a user ensures
+that `~/.scrcpy-auto` exists (created with mode `0700` when absent). This is
+done at process startup instead of package-install time: system installers may
+run as root, under `DESTDIR`, or in a Homebrew sandbox and cannot safely write
+the actual user's home directory.
+
 Each `<name>/` is a self-contained add-on directory. Its entrypoint **must be
 `entrypoint.sh`** (executable) — that is what `--add-on=<name>` resolves to. A
 plugin bundles everything it needs; it is fine to duplicate shared helpers (e.g.
