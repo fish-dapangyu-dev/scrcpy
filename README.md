@@ -87,7 +87,7 @@ Note that USB debugging is not required to run scrcpy in [OTG mode](doc/otg.md).
 Install the matching Apple Silicon or Intel binary without Homebrew:
 
 ```bash
-curl -fsSL https://github.com/fish-dapangyu-dev/scrcpy-auto/releases/download/v4.1-auto3/install.sh | bash
+curl -fsSL https://github.com/fish-dapangyu-dev/scrcpy-auto/releases/download/v4.1-auto4/install.sh | bash
 ```
 
 The installer verifies the release checksum and installs a complete portable

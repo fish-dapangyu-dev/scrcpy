@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPOSITORY="${SCRCPY_AUTO_REPOSITORY:-fish-dapangyu-dev/scrcpy-auto}"
-VERSION="${SCRCPY_AUTO_VERSION:-v4.1-auto3}"
+VERSION="${SCRCPY_AUTO_VERSION:-v4.1-auto4}"
 PREFIX="${SCRCPY_AUTO_PREFIX:-$HOME/.local}"
 BIN_DIR="${SCRCPY_AUTO_BIN_DIR:-$PREFIX/bin}"
 INSTALL_BASE="${SCRCPY_AUTO_INSTALL_BASE:-$PREFIX/lib/scrcpy-auto}"
