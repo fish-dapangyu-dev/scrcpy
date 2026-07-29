@@ -87,12 +87,14 @@ Note that USB debugging is not required to run scrcpy in [OTG mode](doc/otg.md).
 Install the matching Apple Silicon or Intel binary without Homebrew:
 
 ```bash
-curl -fsSL https://github.com/fish-dapangyu-dev/scrcpy-auto/releases/download/v4.1-auto1/install.sh | bash
+curl -fsSL https://github.com/fish-dapangyu-dev/scrcpy-auto/releases/download/v4.1-auto2/install.sh | bash
 ```
 
 The installer verifies the release checksum and installs a complete portable
-bundle under `~/.local`. It includes `scrcpy-auto`, `adb`, and the matching
-`scrcpy-auto-server`, so none of them need to be installed beforehand.
+bundle under `~/.local`. It includes `scrcpy-auto` and the matching
+`scrcpy-auto-server`. It always uses the user's `adb` from `PATH` (or the
+`ADB` environment variable); if adb is absent, the installer only prints an
+installation hint and never installs or bundles another adb client.
 
 
 ## Must-know tips

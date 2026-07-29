@@ -137,6 +137,9 @@ jobs:
               "scrcpy-auto-macos-x86_64-$VERSION.tar.gz" \
               > SHA256SUMS-macos.txt
 
+      - name: Stage installer
+        run: cp install.sh release/output/install.sh
+
       - name: Upload release artifact
         uses: actions/upload-artifact@v7
         with:

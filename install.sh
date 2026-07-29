@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPOSITORY="${SCRCPY_AUTO_REPOSITORY:-fish-dapangyu-dev/scrcpy-auto}"
-VERSION="${SCRCPY_AUTO_VERSION:-v4.1-auto1}"
+VERSION="${SCRCPY_AUTO_VERSION:-v4.1-auto2}"
 PREFIX="${SCRCPY_AUTO_PREFIX:-$HOME/.local}"
 BIN_DIR="${SCRCPY_AUTO_BIN_DIR:-$PREFIX/bin}"
 INSTALL_BASE="${SCRCPY_AUTO_INSTALL_BASE:-$PREFIX/lib/scrcpy-auto}"
@@ -90,11 +90,6 @@ then
     echo "Archive does not contain an executable scrcpy-auto client." >&2
     exit 1
 fi
-if [[ ! -x "$PACKAGE_DIR/adb" ]]
-then
-    echo "Archive does not contain the bundled adb executable." >&2
-    exit 1
-fi
 if [[ ! -s "$PACKAGE_DIR/scrcpy-auto-server" ]]
 then
     echo "Archive does not contain the matching scrcpy-auto-server." >&2
@@ -129,6 +124,15 @@ echo "Installed scrcpy-auto $VERSION for $ARCH."
 echo "  command: $LINK_PATH"
 echo "  bundle:  $DESTINATION"
 echo "  server:  $DESTINATION/scrcpy-auto-server"
+
+ADB_COMMAND="${ADB:-adb}"
+if ! command -v "$ADB_COMMAND" >/dev/null 2>&1
+then
+    echo
+    echo "WARNING: adb was not found in the system environment."
+    echo "Install it separately before running scrcpy-auto:"
+    echo "  brew install android-platform-tools"
+fi
 
 case ":$PATH:" in
     *":$BIN_DIR:"*)

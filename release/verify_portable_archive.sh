@@ -26,11 +26,18 @@ tar xzf "$ARCHIVE" -C "$TMP_DIR"
 
 PACKAGE_DIR="$TMP_DIR/$ROOT"
 test -x "$PACKAGE_DIR/scrcpy-auto"
-test -x "$PACKAGE_DIR/adb"
 test -s "$PACKAGE_DIR/scrcpy-auto-server"
 
-# A portable binary resolves both adb and scrcpy-auto-server next to its real
-# executable path. Keep all three files together in every published archive.
+# adb must always come from the user's PATH (or the ADB environment variable).
+# Shipping another client could restart a shared adb server with a mismatched
+# protocol version.
+if [[ -e "$PACKAGE_DIR/adb" ]]
+then
+    echo "Portable archive must not bundle adb" >&2
+    exit 1
+fi
+
+# The device-side server is version-coupled to the client and stays beside it.
 test -f "$PACKAGE_DIR/scrcpy-auto.1"
 test -f "$PACKAGE_DIR/LICENSE"
 
