@@ -5,12 +5,6 @@ on:
     inputs:
       name:
         description: 'Version name (default is ref name)'
-  push:
-    tags:
-      - 'v*-auto*'
-
-permissions:
-  contents: write
 
 env:
   # $VERSION is used by release scripts
@@ -539,18 +533,3 @@ jobs:
         with:
           name: scrcpy-auto-release-${{ env.VERSION }}
           path: release/output
-
-      - name: Publish GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
-          then
-              gh release upload "$VERSION" release/output/* \
-                  --repo "$GITHUB_REPOSITORY" --clobber
-          else
-              gh release create "$VERSION" release/output/* \
-                  --repo "$GITHUB_REPOSITORY" --verify-tag \
-                  --title "$VERSION" --generate-notes
-          fi
