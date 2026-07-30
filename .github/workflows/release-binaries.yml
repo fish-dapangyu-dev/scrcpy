@@ -86,6 +86,51 @@ jobs:
           name: build-macos-${{ matrix.arch }}-intermediate
           path: release/work/build-macos-${{ matrix.arch }}/dist-tar/
 
+  build-linux-portable:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check architecture
+        run: |
+          actual="$(uname -m)"
+          if [[ "$actual" != x86_64 ]]
+          then
+              echo "Unexpected architecture: $actual" >&2
+              exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # https://wiki.libsdl.org/SDL3/README-linux#build-dependencies
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y meson ninja-build nasm ffmpeg libavcodec-dev \
+             libavdevice-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
+             libusb-1.0-0 libusb-1.0-0-dev libv4l-dev \
+             libasound2-dev libpulse-dev \
+             libaudio-dev libfribidi-dev libjack-dev libsndio-dev libx11-dev libxext-dev \
+             libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+             libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+             libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libthai-dev \
+             libpipewire-0.3-dev libwayland-dev libdecor-0-dev liburing-dev
+
+      - name: Build portable client
+        run: release/build_linux.sh x86_64
+
+      # upload-artifact does not preserve permissions, so wrap the directory.
+      - name: Preserve portable bundle
+        run: |
+          cd release/work/build-linux-x86_64
+          mkdir dist-tar
+          tar -C . -cvf dist-tar/dist.tar.gz dist/
+
+      - name: Upload portable bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-linux-x86_64-intermediate
+          path: release/work/build-linux-x86_64/dist-tar/
+
   build-linux-deb:
     needs:
       - build-scrcpy-server
@@ -119,6 +164,7 @@ jobs:
     needs:
       - build-scrcpy-server
       - build-macos
+      - build-linux-portable
       - build-linux-deb
     runs-on: ubuntu-latest
     steps:
@@ -149,6 +195,20 @@ jobs:
           name: build-linux-deb-intermediate
           path: release/output/
 
+      - name: Download Linux portable client
+        uses: actions/download-artifact@v8
+        with:
+          name: build-linux-x86_64-intermediate
+          path: release/work/build-linux-x86_64/dist-tar/
+
+      - name: Package Linux portable client and server
+        run: |
+          cd release/work/build-linux-x86_64
+          tar xf dist-tar/dist.tar.gz
+          cd ../../..
+          release/package_client.sh linux-x86_64 tar.gz
+          release/verify_portable_archive.sh linux-x86_64
+
       - name: Package arm64 client and server
         run: |
           cd release/work/build-macos-arm64
@@ -178,6 +238,7 @@ jobs:
           cd release/output
           sha256sum \
               "scrcpy-auto_${VERSION#v}_amd64.deb" \
+              "scrcpy-auto-linux-x86_64-$VERSION.tar.gz" \
               "scrcpy-auto-macos-arm64-$VERSION.tar.gz" \
               "scrcpy-auto-macos-x86_64-$VERSION.tar.gz" \
               > SHA256SUMS.txt

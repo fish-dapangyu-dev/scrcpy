@@ -41,4 +41,10 @@ fi
 test -f "$PACKAGE_DIR/scrcpy-auto.1"
 test -f "$PACKAGE_DIR/LICENSE"
 
+case "$TARGET" in
+    linux-*)
+        "$PACKAGE_DIR/scrcpy-auto" --version
+        ;;
+esac
+
 echo "Verified portable archive: $ARCHIVE"
