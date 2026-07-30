@@ -23,6 +23,7 @@
 
 #include <libavutil/frame.h>
 
+#include "adb/adb.h"
 #include "control_exec.h"
 #include "control_msg.h"
 #include "controller.h"
@@ -149,6 +150,8 @@ struct sc_daemon {
     sc_mutex clipboard_mutex; // serialize clipboard-based text injection
 
     char *serial;                // guarded by mutex, may be NULL
+    char real_device_udid[256];  // resolved once on the first device session
+    bool real_device_udid_initialized;
     char device_name[SC_DEVICE_NAME_FIELD_LENGTH]; // guarded by mutex
 
     sc_tick start_tick;
@@ -434,6 +437,21 @@ sc_daemon_session_start(struct sc_daemon *d) {
     if (!connected) {
         sc_daemon_session_stop(d);
         return false;
+    }
+
+    // Resolve the physical device serial exactly once for this daemon. For
+    // TCP/IP devices, s->server.serial is the transport address, so expose both
+    // identities to add-ons without requiring every invocation to shell out to
+    // adb. If get-serialno fails, retain the transport serial as the fallback.
+    if (!d->real_device_udid_initialized) {
+        char *real_device_udid =
+            sc_adb_get_serialno(&s->server.intr, s->server.serial,
+                                SC_ADB_SILENT);
+        snprintf(d->real_device_udid, sizeof(d->real_device_udid), "%s",
+                 real_device_udid ? real_device_udid
+                                  : s->server.serial ? s->server.serial : "");
+        d->real_device_udid_initialized = true;
+        free(real_device_udid);
     }
 
     if (options->video) {
@@ -2264,8 +2282,12 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
 
     // Runtime info for the script
     char serial[256];
+    char real_device_udid[256];
     sc_mutex_lock(&d->mutex);
     snprintf(serial, sizeof(serial), "%s", d->serial ? d->serial : "");
+    snprintf(real_device_udid, sizeof(real_device_udid), "%s",
+             d->real_device_udid_initialized && d->real_device_udid[0]
+                 ? d->real_device_udid : serial);
     sc_mutex_unlock(&d->mutex);
 
     struct sc_size size = {0, 0};
@@ -2276,13 +2298,15 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
     char *exe = sc_file_get_executable_path();
 
     const struct scrcpy_options *o = d->opts;
-    char e_port[32], e_host[40], e_serial[300], e_report[600];
+    char e_port[32], e_host[40], e_serial[300], e_real_udid[300], e_report[600];
     char e_name[160], e_w[32], e_h[32], e_exe[1200];
     char e_codec[24], e_brate[32], e_mfps[40], e_msize[32], e_enc[300],
          e_ctrl[16];
     snprintf(e_port, sizeof(e_port), "SC_DAEMON_PORT=%u", o->daemon_port);
     snprintf(e_host, sizeof(e_host), "SC_DAEMON_HOST=127.0.0.1");
     snprintf(e_serial, sizeof(e_serial), "SC_DEVICE_SERIAL=%s", serial);
+    snprintf(e_real_udid, sizeof(e_real_udid), "SC_REAL_DEVICE_UDID=%s",
+             real_device_udid);
     snprintf(e_report, sizeof(e_report), "SC_REPORT_DIR=%s",
              o->auto_test_report ? o->auto_test_report : "");
     snprintf(e_name, sizeof(e_name), "SC_ADDON_NAME=%s", name);
@@ -2314,10 +2338,10 @@ handle_plugin(struct sc_daemon *d, sc_socket socket, int64_t id,
              result_path ? result_path : "");
 
     // Base env + result file + the primary as SC_ARG_<COMMAND> + one per arg
-    const char *env[15 + 1 + SC_MAX_ADDON_ARGS] = {
-        e_port, e_host, e_serial, e_report, e_name, e_w, e_h, e_exe, e_result,
-        e_codec, e_brate, e_mfps, e_msize, e_enc, e_ctrl};
-    unsigned env_count = 15;
+    const char *env[16 + 1 + SC_MAX_ADDON_ARGS] = {
+        e_port, e_host, e_serial, e_real_udid, e_report, e_name, e_w, e_h,
+        e_exe, e_result, e_codec, e_brate, e_mfps, e_msize, e_enc, e_ctrl};
+    unsigned env_count = 16;
     char *arg_env[1 + SC_MAX_ADDON_ARGS] = {0};
     unsigned arg_env_count = 0;
     bool env_ok = true;

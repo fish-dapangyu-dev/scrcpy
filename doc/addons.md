@@ -149,6 +149,7 @@ In `run` mode the script receives these environment variables:
 | `SC_DAEMON_PORT` | the daemon's `--daemon-port` |
 | `SC_DAEMON_HOST` | `127.0.0.1` |
 | `SC_DEVICE_SERIAL` | the connected device serial |
+| `SC_REAL_DEVICE_UDID` | physical device serial read once with `adb get-serialno` when the daemon starts; falls back to `SC_DEVICE_SERIAL` (for TCP/IP devices, `IP:port`) if unavailable |
 | `SC_REPORT_DIR` | the `--auto-test-report` directory (empty if none) |
 | `SC_VIDEO_WIDTH`, `SC_VIDEO_HEIGHT` | current video size (0 if no frame yet) |
 | `SC_VIDEO_CODEC` | video codec: `h264` / `h265` / `av1` / `vp8` / `vp9` (empty if `--no-video`) |

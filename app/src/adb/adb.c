@@ -232,6 +232,39 @@ sc_adb_kill_server(struct sc_intr *intr, unsigned flags) {
     return process_check_success_intr(intr, pid, "adb kill-server", flags);
 }
 
+char *
+sc_adb_get_serialno(struct sc_intr *intr, const char *serial, unsigned flags) {
+    assert(serial);
+    const char *const argv[] =
+        SC_ADB_COMMAND("-s", serial, "get-serialno");
+
+    sc_pipe pout;
+    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
+    if (pid == SC_PROCESS_NONE) {
+        LOGD("Could not execute \"adb get-serialno\"");
+        return NULL;
+    }
+
+    char buf[256];
+    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
+    sc_pipe_close(pout);
+
+    bool ok =
+        process_check_success_intr(intr, pid, "adb get-serialno", flags);
+    if (!ok || r <= 0 || r == sizeof(buf) - 1) {
+        return NULL;
+    }
+
+    buf[r] = '\0';
+    size_t len = strcspn(buf, " \r\n");
+    buf[len] = '\0';
+    if (!len || !strcmp(buf, "unknown")) {
+        return NULL;
+    }
+
+    return strdup(buf);
+}
+
 bool
 sc_adb_forward(struct sc_intr *intr, const char *serial, uint16_t local_port,
                const char *device_socket_name, unsigned flags) {
