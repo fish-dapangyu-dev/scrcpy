@@ -481,6 +481,14 @@ which runs a whole gesture and blocks). They exist for interactive front-ends
 such as `scrcpy-auto-web`. Touch/scroll coordinates are in video-pixel space;
 the daemon stamps the current video size, matching the device position mapper.
 
+When a test report is active, accepted `inject_touch` samples are grouped by
+connection and `pointer_id`. The daemon writes one report event when the
+gesture reaches `up`; `down` and `move` are not written as separate JSONL
+entries. The event remains an `inject_touch` (it is not converted to
+`control`) and contains `video_size`, the ending `x`/`y`, `pointer_id`,
+`start_x`/`start_y`, `duration_ms`, and `sample_count`. Hover-only movement is
+not recorded. This matches the iOS bridge's manual-control report semantics.
+
 Response envelope:
 
 ```json

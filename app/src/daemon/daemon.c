@@ -37,6 +37,7 @@
 #include "daemon/protocol.h"
 #include "daemon/registry.h"
 #include "daemon/report.h"
+#include "daemon/touch_report.h"
 #include "util/file.h"
 #include "util/process.h"
 #include "decoder.h"
@@ -111,6 +112,8 @@ struct sc_daemon_conn {
     sc_pid plugin_pid; // running add-on child, or SC_PROCESS_NONE (mutex)
     char *uploads[SC_DAEMON_MAX_UPLOADS]; // temp files to unlink on close (mutex)
     unsigned upload_count; // guarded by daemon mutex
+    // Accessed only by this connection's thread; reset when the slot is reused.
+    struct sc_touch_report touch_report;
 };
 
 struct sc_daemon {
@@ -1639,7 +1642,7 @@ reply_push(struct sc_daemon *d, sc_socket socket, int64_t id, bool pushed) {
 
 static void
 handle_inject_touch(struct sc_daemon *d, sc_socket socket, int64_t id,
-                    const struct sc_json *json) {
+                    const struct sc_json *json, unsigned conn_index) {
     enum android_motionevent_action action;
     int64_t x, y;
     if (!parse_motion_action(json, &action)
@@ -1677,6 +1680,8 @@ handle_inject_touch(struct sc_daemon *d, sc_socket socket, int64_t id,
         return;
     }
 
+    int64_t report_pointer_id = json_int_or(json, "pointer_id", 0);
+    uint64_t pointer_id = (uint64_t) report_pointer_id;
     struct sc_control_msg msg;
     msg.type = SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
     msg.inject_touch_event.action = action;
@@ -1684,8 +1689,7 @@ handle_inject_touch(struct sc_daemon *d, sc_socket socket, int64_t id,
         (enum android_motionevent_buttons) action_button;
     msg.inject_touch_event.buttons =
         (enum android_motionevent_buttons) buttons;
-    msg.inject_touch_event.pointer_id =
-        (uint64_t) json_int_or(json, "pointer_id", 0);
+    msg.inject_touch_event.pointer_id = pointer_id;
     msg.inject_touch_event.position.screen_size = size;
     msg.inject_touch_event.position.point.x = (int32_t) x;
     msg.inject_touch_event.position.point.y = (int32_t) y;
@@ -1693,8 +1697,28 @@ handle_inject_touch(struct sc_daemon *d, sc_socket socket, int64_t id,
                                     ? 1.0f
                                     : (float) pressure_u16 / 65536.0f;
 
-    reply_push(d, socket, id,
-               sc_controller_push_msg(&d->session.controller, &msg));
+    bool pushed = sc_controller_push_msg(&d->session.controller, &msg);
+    if (pushed && d->report_active) {
+        struct sc_touch_report_summary summary;
+        if (sc_touch_report_feed(&d->conns[conn_index].touch_report, action,
+                                 pointer_id, (int32_t) x, (int32_t) y,
+                                 sc_tick_now(), &summary)) {
+            char extra[320];
+            snprintf(extra, sizeof(extra),
+                     "\"video_size\":{\"w\":%u,\"h\":%u},"
+                     "\"x\":%" PRId32 ",\"y\":%" PRId32 ","
+                     "\"pointer_id\":%" PRId64 ","
+                     "\"start_x\":%" PRId32 ",\"start_y\":%" PRId32 ","
+                     "\"duration_ms\":%" PRId64 ","
+                     "\"sample_count\":%" PRIu32,
+                     size.width, size.height, summary.x, summary.y,
+                     report_pointer_id,
+                     summary.start_x, summary.start_y, summary.duration_ms,
+                     summary.sample_count);
+            report_log(d, "inject_touch", "up", extra);
+        }
+    }
+    reply_push(d, socket, id, pushed);
 }
 
 static void
@@ -2739,7 +2763,7 @@ handle_request(struct sc_daemon *d, sc_socket socket, const char *json_str,
     } else if (!strcmp(op, "control")) {
         handle_control(d, socket, id, &json, conn_index);
     } else if (!strcmp(op, "inject_touch")) {
-        handle_inject_touch(d, socket, id, &json);
+        handle_inject_touch(d, socket, id, &json, conn_index);
     } else if (!strcmp(op, "inject_key")) {
         handle_inject_key(d, socket, id, &json);
     } else if (!strcmp(op, "inject_text")) {
@@ -2936,6 +2960,7 @@ run_accept(void *data) {
         conn->in_use = true;
         conn->finished = false;
         conn->upload_count = 0;
+        sc_touch_report_init(&conn->touch_report);
         if (!sc_thread_create(&conn->thread, run_connection, "scrcpy-ipc",
                               conn)) {
             conn->in_use = false;

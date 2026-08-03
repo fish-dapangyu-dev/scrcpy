@@ -43,6 +43,7 @@ src = [
     'src/daemon/protocol.c',
     'src/daemon/registry.c',
     'src/daemon/report.c',
+    'src/daemon/touch_report.c',
     'src/screencap.c',
     'src/scrcpy.c',
     'src/screen.c',
@@ -351,6 +352,10 @@ if get_option('buildtype') == 'debug'
         ['test_strbuf', [
             'tests/test_strbuf.c',
             'src/util/strbuf.c',
+        ]],
+        ['test_touch_report', [
+            'tests/test_touch_report.c',
+            'src/daemon/touch_report.c',
         ]],
         ['test_str', [
             'tests/test_str.c',
